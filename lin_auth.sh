@@ -21,13 +21,14 @@ if [ ! -d ".venv" ]; then
     $PYTHON_CMD -m venv .venv
     source .venv/bin/activate
     pip install -r requirements.txt --quiet
-    export PLAYWRIGHT_DOWNLOAD_HOST="https://playwright.azureedge.net"
+    unset PLAYWRIGHT_DOWNLOAD_HOST
     if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
-        if ! python -m playwright install chromium; then
-            if command -v apt-get &>/dev/null; then
-                (apt-get update && (apt-get install -y chromium-browser || apt-get install -y chromium)) || true
-            fi
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && (apt-get install -y chromium-browser || apt-get install -y chromium) || true
         fi
+    fi
+    if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
+        python -m playwright install chromium || true
     fi
     python -m playwright install-deps chromium 2>/dev/null || true
 else

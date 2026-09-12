@@ -37,20 +37,27 @@ pip install -r requirements.txt --quiet
 # Проверка и установка браузера Chromium для Playwright
 echo "[+] Проверка браузера Chromium..."
 
-# Если системный chromium уже установлен через apt — используем его
-if command -v chromium &>/dev/null || command -v chromium-browser &>/dev/null; then
-    echo "[+] Найден системный Chromium: $(command -v chromium || command -v chromium-browser)"
-else
-    # Используем зеркало Azure CDN (обходит блокировки и таймауты storage.googleapis.com)
-    export PLAYWRIGHT_DOWNLOAD_HOST="https://playwright.azureedge.net"
-    echo "[+] Загрузка Playwright Chromium через Azure CDN зеркало..."
-    if ! python -m playwright install chromium; then
-        echo "[!] Не удалось скачать Chromium через CDN."
-        echo "[+] Пытаюсь установить системный Chromium через пакетный менеджер (apt)..."
-        if command -v apt-get &>/dev/null; then
-            apt-get update && (apt-get install -y chromium-browser || apt-get install -y chromium) || true
-        fi
+# Сбрасываем PLAYWRIGHT_DOWNLOAD_HOST, так как на Azure нет сборок Chrome for Testing (код 400)
+unset PLAYWRIGHT_DOWNLOAD_HOST
+
+# 1. Проверяем наличие системного Chromium или устанавливаем его через apt
+if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
+    echo "[+] Системный Chromium не найден. Устанавливаю через пакетный менеджер..."
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq && (apt-get install -y chromium-browser || apt-get install -y chromium) || true
+    elif command -v dnf &>/dev/null; then
+        dnf install -y chromium || true
+    elif command -v yum &>/dev/null; then
+        yum install -y chromium || true
     fi
+fi
+
+# 2. Проверяем результат установки
+if command -v chromium &>/dev/null || command -v chromium-browser &>/dev/null; then
+    echo "[+] Успешно подключен системный Chromium: $(command -v chromium || command -v chromium-browser)"
+else
+    echo "[+] Попытка установки через стандартный Playwright..."
+    python -m playwright install chromium || true
 fi
 
 if [ "$(uname)" == "Linux" ]; then

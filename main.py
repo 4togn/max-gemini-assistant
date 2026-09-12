@@ -120,4 +120,7 @@ class BotApp:
 
 if __name__ == "__main__":
     app = BotApp()
-    asyncio.run(app.run())
+    try:
+        asyncio.run(app.run())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот успешно остановлен. До связи!")

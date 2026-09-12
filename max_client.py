@@ -54,10 +54,13 @@ class MaxClient:
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(config.USER_DATA_DIR),
             headless=True,
-            viewport={"width": 1280, "height": 850},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
             ],
             **self._get_launch_kwargs(),
         )
@@ -156,7 +159,14 @@ class MaxClient:
                 user_data_dir=str(config.USER_DATA_DIR),
                 headless=True,
                 viewport={"width": 1280, "height": 850},
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
                 **self._get_launch_kwargs(),
             )
             self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
@@ -499,7 +509,13 @@ class MaxClient:
         """Корректное завершение работы браузера."""
         self.is_running = False
         if self.context:
-            await self.context.close()
+            try:
+                await self.context.close()
+            except Exception:
+                pass
         if self.playwright:
-            await self.playwright.stop()
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
         logger.info("Браузер MAX закрыт.")
