@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -28,6 +28,11 @@ async def main():
     print("[+] Запуск браузера с видимым окном...")
 
     async with async_playwright() as p:
+        launch_kwargs = {}
+        exe = config.get_chromium_executable()
+        if exe:
+            launch_kwargs["executable_path"] = exe
+
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(config.USER_DATA_DIR),
             headless=False,
@@ -36,6 +41,7 @@ async def main():
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
             ],
+            **launch_kwargs,
         )
 
         page = context.pages[0] if context.pages else await context.new_page()

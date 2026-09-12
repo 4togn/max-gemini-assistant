@@ -37,6 +37,14 @@ class MaxClient:
                     pass
             logger.debug(f"Загружено {len(self.known_bot_hashes)} хешей собственных карточек бота.")
 
+    def _get_launch_kwargs(self) -> dict:
+        kwargs = {}
+        exe = config.get_chromium_executable()
+        if exe:
+            logger.info(f"Используется системный Chromium: {exe}")
+            kwargs["executable_path"] = exe
+        return kwargs
+
     async def start(self):
         """Запускает браузер в невидимом режиме, при необходимости открывая видимое окно для авторизации на ПК."""
         self.playwright = await async_playwright().start()
@@ -51,6 +59,7 @@ class MaxClient:
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
             ],
+            **self._get_launch_kwargs(),
         )
 
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
@@ -109,6 +118,7 @@ class MaxClient:
                 headless=False,
                 viewport={"width": 1280, "height": 850},
                 args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                **self._get_launch_kwargs(),
             )
             login_page = login_context.pages[0] if login_context.pages else await login_context.new_page()
             await login_page.goto("https://web.max.ru", wait_until="networkidle")
@@ -147,6 +157,7 @@ class MaxClient:
                 headless=True,
                 viewport={"width": 1280, "height": 850},
                 args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                **self._get_launch_kwargs(),
             )
             self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
             await self.page.goto("https://web.max.ru", wait_until="networkidle")

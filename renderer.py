@@ -77,7 +77,11 @@ class WebPRenderer:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            launch_kwargs = {"headless": True}
+            exe = config.get_chromium_executable()
+            if exe:
+                launch_kwargs["executable_path"] = exe
+            browser = await p.chromium.launch(**launch_kwargs)
             # device_scale_factor=2 дает кристальную четкость текста (Retina)
             context = await browser.new_context(
                 viewport={"width": config.CARD_WIDTH + 80, "height": 800},

@@ -35,8 +35,24 @@ pip install --upgrade pip --quiet
 pip install -r requirements.txt --quiet
 
 # Проверка и установка браузера Chromium для Playwright
-echo "[+] Проверка браузера Playwright Chromium..."
-python -m playwright install chromium
+echo "[+] Проверка браузера Chromium..."
+
+# Если системный chromium уже установлен через apt — используем его
+if command -v chromium &>/dev/null || command -v chromium-browser &>/dev/null; then
+    echo "[+] Найден системный Chromium: $(command -v chromium || command -v chromium-browser)"
+else
+    # Используем зеркало Azure CDN (обходит блокировки и таймауты storage.googleapis.com)
+    export PLAYWRIGHT_DOWNLOAD_HOST="https://playwright.azureedge.net"
+    echo "[+] Загрузка Playwright Chromium через Azure CDN зеркало..."
+    if ! python -m playwright install chromium; then
+        echo "[!] Не удалось скачать Chromium через CDN."
+        echo "[+] Пытаюсь установить системный Chromium через пакетный менеджер (apt)..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update && (apt-get install -y chromium-browser || apt-get install -y chromium) || true
+        fi
+    fi
+fi
+
 if [ "$(uname)" == "Linux" ]; then
     echo "[+] Проверка системных библиотек для Chromium (Linux)..."
     python -m playwright install-deps chromium 2>/dev/null || true
