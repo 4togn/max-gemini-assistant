@@ -89,17 +89,6 @@
 ========================================
 ```
 
-### 🔄 Поток обработки данных (Pipeline)
-
-```mermaid
-flowchart TD
-    User(["📱 Телефон пользователя"]):::node -->|"1. Текст или Фото"| MAX["💬 MAX Web (web.max.ru)"]:::node
-    MAX -->|"2. Новый data-index"| Gemini["🧠 Gemini 3.8 Flash API"]:::node
-    Gemini -->|"3. Markdown + LaTeX"| Renderer["🎨 WebP Рендерер"]:::node
-    Renderer -->|"4. 2x Retina WebP (~30-50 КБ)"| MAX
-    classDef node fill:#111,stroke:#333,stroke-width:1px,color:#fff;
-```
-
 ---
 
 ## 🚀 Быстрый старт и авторизация
