@@ -129,7 +129,7 @@
 
 1. Склонируйте репозиторий на ваш сервер:
    ```bash
-   git clone https://github.com/your-username/max-gemini-bot.git
+   git clone https://github.com/4togn/max-gemini-assistant.git
    cd max-gemini-bot
    ```
 2. Скопируйте папку `user_data/` с вашего ПК на сервер в папку бота (через SCP, WinSCP, FileZilla или `rsync`):
