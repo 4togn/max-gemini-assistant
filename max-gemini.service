@@ -1,0 +1,18 @@
+[Unit]
+Description=MAX Gemini WebP Assistant Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/MAX_GEMINI
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/bin/sh -c "rm -f /root/MAX_GEMINI/user_data/Singleton* 2>/dev/null || true"
+ExecStart=/root/MAX_GEMINI/.venv/bin/python /root/MAX_GEMINI/main.py
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

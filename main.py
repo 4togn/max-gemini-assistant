@@ -13,7 +13,7 @@ from max_client import MaxClient
 # Обеспечиваем корректный вывод UTF-8 в консоли Windows
 if hasattr(sys.stdout, "reconfigure"):
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     except Exception:
         pass
 
@@ -31,6 +31,7 @@ logger = logging.getLogger("MAX-GEMINI")
 class BotApp:
     def __init__(self):
         self.gemini = GeminiClient()
+        self.gemini_client = self.gemini  # алиас для предотвращения AttributeError
         self.max_client = MaxClient(on_message_callback=self.enqueue_incoming_message)
         self.renderer = WebPRenderer(context_getter=lambda: self.max_client.context)
         self.queue = asyncio.Queue()
@@ -74,7 +75,7 @@ class BotApp:
             webp_file, card_dhash = await self.renderer.render_to_webp(
                 md_content=ai_response,
                 output_path=webp_file,
-                model_name=config.GEMINI_MODEL,
+                model_name=self.gemini.last_used_model,
             )
             logger.info(f"Карточка успешно скомпилирована (размер: {webp_file.stat().st_size / 1024:.1f} Кб)")
 
@@ -84,21 +85,23 @@ class BotApp:
 
         except Exception as e:
             logger.error(f"Ошибка при обработке сообщения: {e}", exc_info=True)
-            # В случае ошибки отправляем понятную карточку с подсказкой
+            # В случае ошибки отправляем понятную карточку с подсказкой в чат
             try:
                 err_msg = str(e)
-                if "503" in err_msg or "unavailable" in err_msg.lower() or "high demand" in err_msg.lower():
-                    user_facing_err = "⚠️ **Сервер Google Gemini временно перегружен** (ошибка 503).\n\nНагрузка спадает за несколько секунд. Пожалуйста, отправьте сообщение или фото ещё раз."
-                elif "429" in err_msg or "quota" in err_msg.lower():
-                    user_facing_err = "⚠️ **Превышен лимит запросов Gemini API** (ошибка 429).\n\nПожалуйста, подождите минуту перед следующим запросом."
+                if "403" in err_msg or "permission" in err_msg.lower() or "not allowed" in err_msg.lower():
+                    user_facing_err = "⚠️ **Ошибка доступа к Gemini API (403 Forbidden)**\n\nМодель недоступна для вашего API-ключа или региона. Все доступные резервные модели также исчерпаны."
+                elif "503" in err_msg or "unavailable" in err_msg.lower() or "high demand" in err_msg.lower():
+                    user_facing_err = "⚠️ **Сервер Google Gemini перегружен (503 Service Unavailable)**\n\nОсновная и все резервные модели временно заняты. Пожалуйста, повторите попытку через несколько секунд."
+                elif "429" in err_msg or "quota" in err_msg.lower() or "resource_exhausted" in err_msg.lower():
+                    user_facing_err = "⚠️ **Исчерпан лимит запросов Gemini API (429 Resource Exhausted)**\n\nВсе доступные модели исчерпали квоту запросов. Пожалуйста, подождите сброса суточного лимита."
                 else:
-                    user_facing_err = f"⚠️ **Не удалось обработать запрос:**\n\n```\n{err_msg[:250]}\n```"
+                    user_facing_err = f"⚠️ **Не удалось обработать запрос:**\n\n```\n{err_msg[:250]}\n```\nВсе доступные модели исчерпаны."
 
                 err_file = config.OUTPUT_DIR / f"error_{int(time.time())}.webp"
                 err_file, err_dhash = await self.renderer.render_to_webp(
                     md_content=user_facing_err,
                     output_path=err_file,
-                    model_name="Assistant",
+                    model_name=self.gemini.last_used_model or "Assistant",
                 )
                 await self.max_client.send_webp_card(err_file, card_dhash=err_dhash)
             except Exception:
@@ -109,6 +112,13 @@ class BotApp:
         logger.info("=========================================")
         logger.info("   Запуск бота MAX Gemini WebP Assistant ")
         logger.info("=========================================")
+
+        # Проверка обязательной основной модели (если нет - бот сообщает и отключается)
+        if not config.PRIMARY_MODEL:
+            err_text = "❌ ОШИБКА: Основная модель (GEMINI_MODEL_1) не указана в .env! Бот отключается."
+            logger.critical(err_text)
+            print(f"\n{err_text}\n", flush=True)
+            sys.exit(1)
 
         # Проверка наличия API ключа
         if not config.GEMINI_API_KEY or config.GEMINI_API_KEY == "your_gemini_api_key_here":
@@ -141,6 +151,9 @@ class BotApp:
 
 
 if __name__ == "__main__":
+    if not config.PRIMARY_MODEL:
+        print("\n❌ ОШИБКА: Основная модель (GEMINI_MODEL_1) не указана в файле .env! Бот отключается.\n", flush=True)
+        sys.exit(1)
     app = BotApp()
     try:
         asyncio.run(app.run())

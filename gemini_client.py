@@ -52,10 +52,30 @@ def _detect_mime_type(data: bytes) -> str:
     return "image/jpeg"
 
 
+MODELS_CASCADE = getattr(
+    config,
+    "MODELS_CASCADE",
+    [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+    ],
+)
+
+
 class GeminiClient:
-    def __init__(self, api_key: str = None, model: str = None):
+    def __init__(
+        self,
+        api_key: str = None,
+        primary_model: str = None,
+        backup_models: Optional[List[str]] = None,
+    ):
         self.api_key = api_key or config.GEMINI_API_KEY
-        self.model_name = model or config.GEMINI_MODEL
+        self.primary_model = primary_model or config.PRIMARY_MODEL
+        self.backup_models = backup_models if backup_models is not None else list(config.BACKUP_MODELS)
+        self.model_name = self.primary_model or ""
+        self.last_used_model = self.primary_model or "Assistant"
         self._client = None
 
     def _get_client(self):
@@ -72,10 +92,17 @@ class GeminiClient:
     ) -> str:
         """
         Отправляет запрос к модели Gemini (текстовый или мультимодальный с фото).
-        Поддерживает автоматический быстрый retry при 503 / 429.
+        Правила выполнения:
+        1. К основной модели (GEMINI_MODEL_1) делается ровно 3 попытки.
+        2. Если основная модель не ответила после 3 попыток:
+           - если резервные модели не заданы (GEMINI_MODEL_2..4 пустые) -> сразу выбрасывается ошибка.
+           - если заданы -> переходит по очереди к резервным моделям (пустые переменные уже пропущены).
+        3. Если и последняя резервная модель не ответила -> выбрасывается ошибка (бот отправляет карточку в чат).
         """
-        client = self._get_client()
+        if not self.primary_model:
+            raise ValueError("Основная модель (GEMINI_MODEL_1) не указана в .env!")
 
+        client = self._get_client()
         contents = []
 
         # Обработка изображений
@@ -94,9 +121,9 @@ class GeminiClient:
                     )
 
             log_text = prompt[:60] if prompt else "[Фото без текста]"
-            logger.info(f"Мультимодальный запрос к Gemini [{self.model_name}] с фото ({len(images)} шт.): {log_text}")
+            logger.info(f"Мультимодальный запрос к Gemini [{self.primary_model}] с фото ({len(images)} шт.): {log_text}")
         else:
-            logger.info(f"Текстовый запрос к Gemini [{self.model_name}]: {prompt[:60]}...")
+            logger.info(f"Текстовый запрос к Gemini [{self.primary_model}]: {prompt[:60]}...")
 
         # Текст запроса / подпись к фото
         if prompt and prompt.strip():
@@ -105,53 +132,106 @@ class GeminiClient:
             # Универсальный prompt для фото без текста: ИИ сам автономно определяет суть
             contents.append("Внимательно изучи изображение. Проанализируй его суть и автономно определи, что требуется: реши задачи/тесты, определи точную модель и характеристики предмета/устройства, исправь код или извлеки информацию. Дай исчерпывающий структурированный ответ по существу.")
 
-        # Строго используем указанную пользователем модель (gemini-3.8-flash)
-        last_error = None
-        for attempt in range(1, 5):
-            try:
-                if attempt > 1:
-                    logger.info(f"Повторная попытка ({attempt}/4) к Gemini [{self.model_name}]...")
-                response = await client.aio.models.generate_content(
-                    model=self.model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_INSTRUCTION,
-                        temperature=0.7,
-                    ),
-                )
-                if response and response.text:
-                    return response.text
-                else:
-                    raise ValueError("Получен пустой ответ от Gemini API.")
-            except Exception as e:
-                last_error = e
-                err_str = str(e)
-                is_transient = any(
-                    term in err_str.lower()
-                    for term in ["503", "429", "unavailable", "high demand", "resourceexhausted"]
-                )
-                if is_transient and attempt < 4:
-                    wait_sec = 0.5 * (2 ** (attempt - 1))
-                    logger.warning(f"Модель {self.model_name} временно занята (503/429). Быстрый повтор через {wait_sec:.1f}с...")
-                    await asyncio.sleep(wait_sec)
-                    continue
-                else:
-                    logger.error(f"Ошибка вызова Gemini API [{self.model_name}]: {e}")
-                    break
+        # Составляем список моделей: основная + заданные резервные (пустые уже отфильтрованы)
+        models_to_try = [self.primary_model] + self.backup_models
 
-        if last_error:
-            raise last_error
+        last_error = None
+        for model_idx, current_model in enumerate(models_to_try, start=1):
+            is_primary = (model_idx == 1)
+            model_type = "Основная" if is_primary else f"Резервная #{model_idx - 1}"
+
+            # Делаем до 4 попыток на каждую модель (поскольку модель часто отвечает с 3-4 попытки)
+            for attempt in range(1, 5):
+                try:
+                    if attempt > 1:
+                        logger.info(f"Повторная попытка ({attempt}/4) к {model_type.lower()} модели [{current_model}]...")
+                    else:
+                        logger.info(f"Запрос к {model_type.lower()} модели [{current_model}] (попытка 1/4)...")
+
+                    response = await client.aio.models.generate_content(
+                        model=current_model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_INSTRUCTION,
+                            temperature=0.7,
+                        ),
+                    )
+                    if response and response.text:
+                        self.last_used_model = current_model
+                        logger.info(f"Успешный ответ от [{current_model}] (попытка {attempt}/4).")
+                        return response.text
+                    else:
+                        raise ValueError(f"Получен пустой ответ от [{current_model}].")
+
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e)
+                    logger.warning(
+                        f"{model_type} модель [{current_model}] (попытка {attempt}/4) ошибка: {e}"
+                    )
+
+                    # Если исчерпан суточный лимит запросов (20 req/day per project), повторять бессмысленно
+                    is_daily_limit = "perday" in err_str.lower() or ("quota exceeded" in err_str.lower() and "limit: 20" in err_str.lower())
+                    if is_daily_limit:
+                        logger.warning(
+                            f"Суточный лимит для [{current_model}] исчерпан (429 perday). "
+                            f"Прекращаю повторы к этой модели и перехожу к следующей."
+                        )
+                        break
+
+                    # Пауза перед следующей попыткой к той же модели (0.5с)
+                    if attempt < 4:
+                        await asyncio.sleep(0.5)
+
+            # Если все попытки к текущей модели завершились неудачей
+            has_next = (model_idx < len(models_to_try))
+            if has_next:
+                next_model = models_to_try[model_idx]
+                logger.warning(
+                    f"Все 4 попытки к [{current_model}] исчерпаны. "
+                    f"Переключаюсь на следующую модель: [{next_model}]..."
+                )
+            else:
+                logger.error(
+                    f"Все 4 попытки к последней доступной модели [{current_model}] исчерпаны. "
+                    f"Других моделей в .env нет."
+                )
+
+        # Если все доступные модели завершились ошибкой
+        raise last_error
 
     async def warmup(self):
         """Прогревает HTTP-клиент и SSL-сессию к Gemini при старте бота."""
+        if not self.primary_model:
+            return
+
+        client = self._get_client()
+
+        # Сначала пробуем прогреть основную модель
         try:
-            client = self._get_client()
-            logger.info(f"Прогрев соединения с Gemini [{self.model_name}]...")
+            logger.info(f"Прогрев соединения с основной моделью [{self.primary_model}]...")
             await client.aio.models.generate_content(
-                model=self.model_name,
+                model=self.primary_model,
                 contents="1+1=?",
                 config=types.GenerateContentConfig(temperature=0.1),
             )
-            logger.info("Соединение с Gemini успешно прогрето (готов к мгновенному ответу).")
+            logger.info(f"Основная модель [{self.primary_model}] успешно прогрета.")
+            self.last_used_model = self.primary_model
+            return
         except Exception as e:
-            logger.warning(f"Прогрев Gemini завершился с предупреждением: {e}")
+            logger.warning(f"Основная модель [{self.primary_model}] недоступна при прогреве (квота/занято): {e}")
+
+        # Если основная недоступна, пробуем резервные по очереди
+        for backup_model in self.backup_models:
+            try:
+                logger.info(f"Прогрев соединения с резервной моделью [{backup_model}]...")
+                await client.aio.models.generate_content(
+                    model=backup_model,
+                    contents="1+1=?",
+                    config=types.GenerateContentConfig(temperature=0.1),
+                )
+                logger.info(f"Резервная модель [{backup_model}] успешно прогрета.")
+                self.last_used_model = backup_model
+                return
+            except Exception as e:
+                logger.warning(f"Резервная модель [{backup_model}] недоступна при прогреве: {e}")
