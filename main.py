@@ -31,17 +31,32 @@ logger = logging.getLogger("MAX-GEMINI")
 class BotApp:
     def __init__(self):
         self.gemini = GeminiClient()
-        self.renderer = WebPRenderer()
-        self.max_client = MaxClient(on_message_callback=self.handle_incoming_message)
-        self.is_processing = False
+        self.max_client = MaxClient(on_message_callback=self.enqueue_incoming_message)
+        self.renderer = WebPRenderer(context_getter=lambda: self.max_client.context)
+        self.queue = asyncio.Queue()
+        self.worker_task: Optional[asyncio.Task] = None
 
-    async def handle_incoming_message(self, user_text: str, images: Optional[list] = None):
-        """Обработка входящего текстового или фото-сообщения."""
-        if self.is_processing:
-            logger.info("Уже идет генерация предыдущего ответа, пропускаем повторный вызов.")
-            return
+    async def enqueue_incoming_message(self, user_text: str, images: Optional[list] = None):
+        """Ставит входящее сообщение в очередь на обработку, чтобы ничего не терялось."""
+        await self.queue.put((user_text, images))
+        msg_type = f"фото ({len(images)} шт.) с текстом" if (images and user_text) else ("фото" if images else "текст")
+        logger.info(f"==> Сообщение [{msg_type}] добавлено в очередь (в очереди: {self.queue.qsize()}): '{user_text[:80]}'")
 
-        self.is_processing = True
+    async def _message_worker(self):
+        """Фоновый воркер: обрабатывает сообщения из очереди последовательно."""
+        while True:
+            try:
+                user_text, images = await self.queue.get()
+                await self._process_single_message(user_text, images)
+                self.queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Непредвиденная ошибка в воркере сообщений: {e}", exc_info=True)
+                await asyncio.sleep(1)
+
+    async def _process_single_message(self, user_text: str, images: Optional[list] = None):
+        """Обработка одного входящего текстового или фото-сообщения."""
         msg_type = f"фото ({len(images)} шт.) с текстом" if (images and user_text) else ("фото" if images else "текст")
         logger.info(f"==> Принято сообщение [{msg_type}]: '{user_text[:80]}'")
 
@@ -51,20 +66,20 @@ class BotApp:
             ai_response = await self.gemini.generate_response(prompt=user_text, images=images)
             logger.info(f"Ответ от Gemini получен ({len(ai_response)} симв.)")
 
-            # 2. Рендеринг в WebP
+            # 2. Рендеринг в WebP (мгновенно через прогретый браузер)
             timestamp = int(time.time())
             webp_file = config.OUTPUT_DIR / f"answer_{timestamp}.webp"
 
             logger.info(f"Компиляция карточки в {webp_file.name}...")
-            await self.renderer.render_to_webp(
+            webp_file, card_dhash = await self.renderer.render_to_webp(
                 md_content=ai_response,
                 output_path=webp_file,
                 model_name=config.GEMINI_MODEL,
             )
             logger.info(f"Карточка успешно скомпилирована (размер: {webp_file.stat().st_size / 1024:.1f} Кб)")
 
-            # 3. Отправка в MAX
-            await self.max_client.send_webp_card(webp_file)
+            # 3. Отправка в MAX с регистрацией dHash
+            await self.max_client.send_webp_card(webp_file, card_dhash=card_dhash)
             logger.info("==> Ответ успешно доставлен в чат MAX!")
 
         except Exception as e:
@@ -80,16 +95,14 @@ class BotApp:
                     user_facing_err = f"⚠️ **Не удалось обработать запрос:**\n\n```\n{err_msg[:250]}\n```"
 
                 err_file = config.OUTPUT_DIR / f"error_{int(time.time())}.webp"
-                await self.renderer.render_to_webp(
+                err_file, err_dhash = await self.renderer.render_to_webp(
                     md_content=user_facing_err,
                     output_path=err_file,
                     model_name="Assistant",
                 )
-                await self.max_client.send_webp_card(err_file)
+                await self.max_client.send_webp_card(err_file, card_dhash=err_dhash)
             except Exception:
                 pass
-        finally:
-            self.is_processing = False
 
     async def run(self):
         """Главный цикл работы приложения."""
@@ -104,6 +117,9 @@ class BotApp:
             logger.warning("Пожалуйста, откройте .env и вставьте ваш ключ Google Gemini.")
             logger.warning("=" * 60)
 
+        # Запускаем фоновый воркер обработки очереди
+        self.worker_task = asyncio.create_task(self._message_worker())
+
         try:
             # Запуск клиента MAX
             await self.max_client.start()
@@ -115,6 +131,9 @@ class BotApp:
         except Exception as e:
             logger.critical(f"Критическая ошибка: {e}", exc_info=True)
         finally:
+            if self.worker_task:
+                self.worker_task.cancel()
+            await self.renderer.close()
             await self.max_client.close()
 
 

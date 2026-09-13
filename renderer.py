@@ -10,10 +10,21 @@ from playwright.async_api import async_playwright
 import config
 
 
+from history_manager import compute_dhash
+
 class WebPRenderer:
-    def __init__(self):
+    def __init__(self, context_getter=None):
         self.env = Environment(loader=FileSystemLoader(str(config.TEMPLATES_DIR)))
         self.template = self.env.get_template("card.html")
+        self.context_getter = context_getter
+        self._fallback_playwright = None
+        self._fallback_browser = None
+        self._fallback_context = None
+        self.last_card_dhash = None
+
+    def set_context_getter(self, getter):
+        """Устанавливает функцию получения активного контекста браузера."""
+        self.context_getter = getter
 
     def _protect_math(self, text: str):
         """
@@ -68,42 +79,60 @@ class WebPRenderer:
             width=config.CARD_WIDTH,
         )
 
-    async def render_to_webp(self, md_content: str, output_path: Path, model_name: str = None) -> Path:
+    async def render_to_webp(self, md_content: str, output_path: Path, model_name: str = None) -> tuple[Path, int]:
         """
-        Рендерит Markdown в HTML и делает скриншот в формате WebP.
+        Рендерит Markdown в HTML через прогретый браузер без повторного запуска процесса
+        и компилирует карточку в WebP со сверхбыстрой скоростью (в разы быстрее).
+        Возвращает кортеж (output_path, card_dhash).
         """
         html = self.generate_html(md_content, model_name)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        async with async_playwright() as p:
-            launch_kwargs = {"headless": True}
-            exe = config.get_chromium_executable()
-            if exe:
-                launch_kwargs["executable_path"] = exe
-            browser = await p.chromium.launch(**launch_kwargs)
-            # device_scale_factor=2 дает кристальную четкость текста (Retina)
-            context = await browser.new_context(
-                viewport={"width": config.CARD_WIDTH + 80, "height": 800},
-                device_scale_factor=2,
-            )
-            page = await context.new_page()
+        context = self.context_getter() if self.context_getter else None
+        if not context:
+            if not self._fallback_context:
+                self._fallback_playwright = await async_playwright().start()
+                launch_kwargs = {
+                    "headless": True,
+                    "args": [
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ],
+                }
+                exe = config.get_chromium_executable()
+                if exe:
+                    launch_kwargs["executable_path"] = exe
+                self._fallback_browser = await self._fallback_playwright.chromium.launch(**launch_kwargs)
+                self._fallback_context = await self._fallback_browser.new_context(
+                    viewport={"width": config.CARD_WIDTH + 80, "height": 800},
+                    device_scale_factor=2,
+                )
+            context = self._fallback_context
 
-            # Загружаем HTML контент
-            await page.set_content(html, wait_until="networkidle")
-
-            # Ожидаем отрисовки KaTeX и Highlight.js
-            await page.wait_for_timeout(350)
+        # Рендерим страницу в новой вкладке прогретого браузера (занимает миллисекунды)
+        page = await context.new_page()
+        try:
+            # Указываем base href на локальную папку шаблонов для мгновенной загрузки KaTeX и Highlight.js
+            base_html = html.replace("<head>", f'<head><base href="file://{config.TEMPLATES_DIR}/">')
+            await page.set_content(base_html, wait_until="domcontentloaded")
+            await page.wait_for_timeout(80)
 
             # Получаем элемент карточки и делаем PNG-скриншот
             card_el = page.locator("#card")
             png_bytes = await card_el.screenshot(type="png")
-            await browser.close()
+        finally:
+            await page.close()
 
-        # Сжимаем и сохраняем в легковесный WebP через Pillow (RGB, quality=82)
+        # Вычисляем перцептивный dHash карточки для предотвращения самозацикливания бота
+        card_dhash = compute_dhash(png_bytes)
+        self.last_card_dhash = card_dhash
+
+        # Сжимаем и сохраняем в легковесный WebP через Pillow (RGB, quality=82, method=4 - быстрый оптимальный режим)
         image = Image.open(io.BytesIO(png_bytes))
         if image.mode in ("RGBA", "P"):
-            # Создаем сплошной черный фон
             background = Image.new("RGB", image.size, (0, 0, 0))
             if image.mode == "RGBA":
                 background.paste(image, mask=image.split()[3])
@@ -113,6 +142,24 @@ class WebPRenderer:
         else:
             image = image.convert("RGB")
 
-        image.save(output_path, "WEBP", quality=82, method=6)
+        image.save(output_path, "WEBP", quality=82, method=4)
 
-        return output_path
+        return output_path, card_dhash
+
+    async def close(self):
+        """Очистка ресурсов fallback-браузера при завершении."""
+        if self._fallback_context:
+            try:
+                await self._fallback_context.close()
+            except Exception:
+                pass
+        if self._fallback_browser:
+            try:
+                await self._fallback_browser.close()
+            except Exception:
+                pass
+        if self._fallback_playwright:
+            try:
+                await self._fallback_playwright.stop()
+            except Exception:
+                pass

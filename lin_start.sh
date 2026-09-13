@@ -28,41 +28,44 @@ fi
 # Активация виртуального окружения
 echo "[+] Активация виртуального окружения..."
 source .venv/bin/activate
+export PYTHONUNBUFFERED=1
 
-# Проверка и установка зависимостей
-echo "[+] Проверка и установка зависимостей из requirements.txt..."
-pip install --upgrade pip --quiet
-pip install -r requirements.txt --quiet
+# Проверка, не запущен ли уже бот (шаблон [p]ython исключает сам pgrep)
+EXISTING_PID=$(pgrep -f "[p]ython main.py" || true)
+if [ -n "$EXISTING_PID" ]; then
+    echo "[!] ВНИМАНИЕ: Бот уже работает в системе (PID: $EXISTING_PID)!"
+    echo "[!] Чтобы остановить или перезапустить, используйте: ./lin_stop.sh"
+    exit 1
+fi
 
-# Проверка и установка браузера Chromium для Playwright
-echo "[+] Проверка браузера Chromium..."
+# Очистка устаревших блокировок Chromium при мертвом процессе
+if [ -d "user_data" ]; then
+    rm -f user_data/SingletonLock user_data/SingletonCookie user_data/SingletonSocket 2>/dev/null || true
+fi
 
-# Сбрасываем PLAYWRIGHT_DOWNLOAD_HOST, так как на Azure нет сборок Chrome for Testing (код 400)
-unset PLAYWRIGHT_DOWNLOAD_HOST
-
-# 1. Проверяем наличие системного Chromium или устанавливаем его через apt
-if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
-    echo "[+] Системный Chromium не найден. Устанавливаю через пакетный менеджер..."
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq && (apt-get install -y chromium-browser || apt-get install -y chromium) || true
-    elif command -v dnf &>/dev/null; then
-        dnf install -y chromium || true
-    elif command -v yum &>/dev/null; then
-        yum install -y chromium || true
+# Проверка и установка зависимостей (быстрый запуск, если уже ставилось)
+if [ ! -f ".venv/.deps_installed" ]; then
+    echo "[+] Первая настройка: проверка и установка зависимостей из requirements.txt..."
+    pip install -r requirements.txt --quiet
+    
+    unset PLAYWRIGHT_DOWNLOAD_HOST
+    if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
+        echo "[+] Системный Chromium не найден. Устанавливаю..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && (apt-get install -y chromium-browser || apt-get install -y chromium) || true
+        fi
     fi
+
+    if [ "$(uname)" == "Linux" ]; then
+        echo "[+] Проверка системных библиотек Chromium..."
+        python -m playwright install-deps chromium 2>/dev/null || true
+    fi
+    touch .venv/.deps_installed
 fi
 
-# 2. Проверяем результат установки
-if command -v chromium &>/dev/null || command -v chromium-browser &>/dev/null; then
-    echo "[+] Успешно подключен системный Chromium: $(command -v chromium || command -v chromium-browser)"
-else
-    echo "[+] Попытка установки через стандартный Playwright..."
-    python -m playwright install chromium || true
-fi
-
-if [ "$(uname)" == "Linux" ]; then
-    echo "[+] Проверка системных библиотек для Chromium (Linux)..."
-    python -m playwright install-deps chromium 2>/dev/null || true
+# Проверка наличия Chromium
+if command -v chromium &>/dev/null || command -v chromium-browser &>/dev/null || [ -f "/snap/bin/chromium" ]; then
+    echo "[+] Системный Chromium готов к работе."
 fi
 
 # Проверка .env файла

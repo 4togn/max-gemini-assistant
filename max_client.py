@@ -24,6 +24,7 @@ class MaxClient:
         self.is_running = False
         self.is_uploading = False
         self.known_bot_hashes: set = set()
+        self.known_bot_image_urls: set = set()
         self._load_known_output_hashes()
 
     def _load_known_output_hashes(self):
@@ -31,11 +32,15 @@ class MaxClient:
         if config.OUTPUT_DIR.exists():
             for p in config.OUTPUT_DIR.glob("*.webp"):
                 try:
-                    h = hashlib.sha256(p.read_bytes()).hexdigest()
-                    self.known_bot_hashes.add(h)
+                    b = p.read_bytes()
+                    self.known_bot_hashes.add(hashlib.sha256(b).hexdigest())
+                    from history_manager import compute_dhash
+                    dh = compute_dhash(b)
+                    if dh:
+                        self.tracker.add_bot_dhash(dh)
                 except Exception:
                     pass
-            logger.debug(f"Загружено {len(self.known_bot_hashes)} хешей собственных карточек бота.")
+            logger.info(f"Загружено {len(self.known_bot_hashes)} хешей и {len(self.tracker.known_bot_dhashes)} dHash собственных карточек бота.")
 
     def _get_launch_kwargs(self) -> dict:
         kwargs = {}
@@ -45,8 +50,33 @@ class MaxClient:
             kwargs["executable_path"] = exe
         return kwargs
 
+    @staticmethod
+    def clean_stale_locks():
+        """Очищает устаревший SingletonLock от аварийно завершенных процессов Chromium."""
+        lock_file = config.USER_DATA_DIR / "SingletonLock"
+        if lock_file.exists() or lock_file.is_symlink():
+            try:
+                target = os.readlink(lock_file) if lock_file.is_symlink() else ""
+                pid = int(target.split("-")[-1]) if "-" in target else None
+                if pid:
+                    os.kill(pid, 0)
+                    logger.warning(f"Внимание: процесс Chromium с PID {pid} всё ещё работает.")
+                    return
+            except (ProcessLookupError, ValueError):
+                logger.info("Обнаружен устаревший SingletonLock. Очистка перед запуском...")
+                for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+                    p = config.USER_DATA_DIR / name
+                    if p.exists() or p.is_symlink():
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
     async def start(self):
         """Запускает браузер в невидимом режиме, при необходимости открывая видимое окно для авторизации на ПК."""
+        self.clean_stale_locks()
         self.playwright = await async_playwright().start()
 
         # 1. Запускаем браузер в фоновом (невидимом) режиме
@@ -54,6 +84,7 @@ class MaxClient:
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(config.USER_DATA_DIR),
             headless=True,
+            device_scale_factor=2,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             args=[
                 "--disable-blink-features=AutomationControlled",
@@ -68,20 +99,28 @@ class MaxClient:
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 
         logger.info("Открытие https://web.max.ru...")
-        await self.page.goto("https://web.max.ru", wait_until="networkidle")
+        await self.page.goto("https://web.max.ru", wait_until="domcontentloaded", timeout=45000)
 
-        # 2. Проверяем, есть ли уже сохраненная авторизация
-        logger.info("Проверка статуса авторизации в MAX...")
+        # 2. Проверяем, есть ли уже сохраненная авторизация (даем до 25 секунд на загрузку SPA на VDS)
+        logger.info("Проверка статуса авторизации в MAX (ожидание загрузки интерфейса)...")
         is_authorized = False
-        for _ in range(5):
+        for i in range(12):
             if await self._is_in_app():
                 is_authorized = True
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
         # 3. Если пользователь НЕ авторизован — обрабатываем интерактивный вход
         if not is_authorized:
-            logger.info("Сессия не найдена. Требуется первичная авторизация...")
+            logger.info("Сессия не найдена или страница долго загружается...")
+            # Сохраняем отладочный скриншот страницы
+            try:
+                debug_screen = config.OUTPUT_DIR / "auth_failed.png"
+                await self.page.screenshot(path=str(debug_screen))
+                logger.info(f"Скриншот текущего состояния сохранен в: {debug_screen}")
+            except Exception:
+                pass
+
             # Закрываем фоновый браузер перед открытием окна
             await self.context.close()
             self.context = None
@@ -97,6 +136,7 @@ class MaxClient:
                 logger.error("=" * 68)
                 logger.error("ОШИБКА: Авторизация не найдена, а запуск произведен на сервере без экрана!")
                 logger.error("В консоли сервера отсутствует графическая оболочка ($DISPLAY не задан).")
+                logger.error(f"Скриншот экрана сохранен в: {config.OUTPUT_DIR / 'auth_failed.png'}")
                 logger.error("")
                 logger.error("НАПОМИНАНИЕ: Первую авторизацию необходимо выполнять на устройстве с экраном!")
                 logger.error("ИНСТРУКЦИЯ:")
@@ -158,6 +198,7 @@ class MaxClient:
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir=str(config.USER_DATA_DIR),
                 headless=True,
+                device_scale_factor=2,
                 viewport={"width": 1280, "height": 850},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 args=[
@@ -187,31 +228,19 @@ class MaxClient:
             }""")
             await asyncio.sleep(1)
 
-        all_existing_indices = await self.page.evaluate("""() => {
-            const history = document.querySelector('[class*="history"]') || document.querySelector('main') || document.body;
-            const items = history.querySelectorAll('[data-index]');
-            const indices = [];
-            items.forEach(it => {
-                const idxStr = it.getAttribute('data-index');
-                if (idxStr !== null) {
-                    const idx = parseInt(idxStr, 10);
-                    if (!isNaN(idx)) indices.push(idx);
-                }
-            });
-            return indices;
-        }""")
+        all_existing_messages = await self._get_unhandled_messages()
 
-        if all_existing_indices:
-            max_idx = max(all_existing_indices)
-            for idx in all_existing_indices:
-                self.tracker.mark_handled(idx)
-            self.tracker.sync_baseline(max_idx)
+        if len(self.tracker.handled_signatures) == 0:
+            all_sigs = [m["signature"] for m in all_existing_messages]
+            self.tracker.sync_baseline(all_sigs)
             logger.info(
-                f"Стартовая синхронизация: зафиксировано {len(all_existing_indices)} существующих сообщений "
-                f"(базовый ID: {max_idx}). Старые сообщения проигнорированы."
+                f"Первичный запуск: зафиксировано {len(all_sigs)} существующих сообщений как базовые."
             )
         else:
-            logger.info("В чате пока нет сообщений.")
+            logger.info(
+                f"Повторный запуск бота: в базе {len(self.tracker.handled_signatures)} обработанных сообщений. "
+                f"Новых недавних сообщений для обработки: {len(all_existing_messages)}."
+            )
 
         logger.info("=" * 60)
         logger.info("Бот готов к работе! Он работает в НЕВИДИМОМ режиме и ожидает сообщений.")
@@ -243,16 +272,18 @@ class MaxClient:
             return
 
         chat_loc = self.page.locator(f"text='{chat_name}'").first
-        if await chat_loc.count() > 0:
-            await chat_loc.click()
-            await self.page.wait_for_timeout(1500)
+        try:
+            await chat_loc.wait_for(state="visible", timeout=15000)
+            await chat_loc.click(no_wait_after=True)
+            await self.page.wait_for_timeout(2000)
             logger.info(f"Чат '{chat_name}' успешно открыт.")
-        else:
-            logger.warning(f"Не удалось найти элемент с текстом '{chat_name}'.")
+        except Exception as e:
+            logger.warning(f"Не удалось открыть чат '{chat_name}': {e}")
 
-    async def send_webp_card(self, webp_path: Path):
+    async def send_webp_card(self, webp_path: Path, card_dhash: Optional[int] = None):
         """
-        Отправляет сгенерированный WebP файл в открытый чат через меню вложений.
+        Отправляет сгенерированный WebP файл в открытый чат через меню вложений
+        и сразу фиксирует сигнатуру и хеш отправленного сообщения для защиты от самоответов.
         """
         webp_path = Path(webp_path).resolve()
         if not webp_path.exists():
@@ -262,9 +293,17 @@ class MaxClient:
         self.is_uploading = True
 
         try:
-            # Запоминаем хеш отправляемой карточки, чтобы бот гарантированно игнорировал её
+            # Запоминаем хеш и dHash отправляемой карточки
             try:
-                self.known_bot_hashes.add(hashlib.sha256(webp_path.read_bytes()).hexdigest())
+                raw_bytes = webp_path.read_bytes()
+                self.known_bot_hashes.add(hashlib.sha256(raw_bytes).hexdigest())
+                if card_dhash:
+                    self.tracker.add_bot_dhash(card_dhash)
+                else:
+                    from history_manager import compute_dhash
+                    dh = compute_dhash(raw_bytes)
+                    if dh:
+                        self.tracker.add_bot_dhash(dh)
             except Exception:
                 pass
 
@@ -304,18 +343,14 @@ class MaxClient:
 
             logger.info(f"Карточка {webp_path.name} успешно отправлена в MAX!")
 
-            # Ожидаем появления нового индекса сообщения в DOM и отмечаем его как обработанный
-            for _ in range(12):
-                await asyncio.sleep(0.5)
-                cur_max = await self._get_current_max_index()
-                if cur_max is not None and cur_max > start_max:
-                    for idx in range(start_max + 1, cur_max + 1):
-                        self.tracker.mark_handled(idx)
-                    break
-            else:
-                cur_max = await self._get_current_max_index()
-                if cur_max is not None:
-                    self.tracker.mark_handled(cur_max)
+            # 5. Ожидаем появления сообщения в DOM и отмечаем его сигнатуру как обработанную
+            await asyncio.sleep(1.5)
+            new_msgs = await self._get_unhandled_messages()
+            for m in new_msgs:
+                self.tracker.mark_handled(m["signature"])
+                for img_url in m.get("images", []):
+                    self.known_bot_image_urls.add(img_url)
+                logger.info(f"Собственная карточка бота [ID {m.get('index')}] зафиксирована и помечена как обработанная.")
 
         except Exception as e:
             logger.error(f"Ошибка при отправке WebP в чат: {e}", exc_info=True)
@@ -339,49 +374,56 @@ class MaxClient:
                 new_messages = await self._get_unhandled_messages()
 
                 for msg in new_messages:
-                    idx = msg["index"]
+                    sig = msg["signature"]
+                    idx = msg.get("index", 0)
                     text = msg["text"]
                     images = msg.get("images", [])
 
-                    # Отмечаем индекс как обработанный
-                    self.tracker.mark_handled(idx)
+                    # Отмечаем сообщение как обработанное по сигнатуре
+                    self.tracker.mark_handled(sig)
 
                     # 1. Если сообщение содержит фото от пользователя
                     if images:
                         image_bytes_list = []
                         for img_url in images:
+                            if img_url in self.known_bot_image_urls:
+                                logger.info(f"Пропущена собственная карточка бота [ID {idx}] (совпадение URL).")
+                                continue
                             try:
                                 resp = await self.page.request.get(img_url, timeout=10000)
                                 if resp.status == 200:
-                                    image_bytes_list.append(await resp.body())
+                                    b = await resp.body()
+                                    h = hashlib.sha256(b).hexdigest()
+                                    if h in self.known_bot_hashes:
+                                        logger.info(f"Пропущена собственная карточка бота [ID {idx}] (SHA256).")
+                                        continue
+                                    if self.tracker.is_bot_card_dhash(b):
+                                        logger.info(f"Пропущена собственная карточка бота [ID {idx}] (перцептивный dHash совпал с карточкой).")
+                                        continue
+                                    image_bytes_list.append(b)
                             except Exception as err:
                                 logger.warning(f"Не удалось скачать фото {img_url}: {err}")
 
-                        # Фильтрация: отсекаем собственные WebP-карточки бота
-                        filtered_bytes = []
-                        for b in image_bytes_list:
-                            h = hashlib.sha256(b).hexdigest()
-                            if h in self.known_bot_hashes:
-                                logger.info(f"Пропущена собственная карточка бота [ID {idx}] (hash: {h[:8]}).")
-                                continue
-                            filtered_bytes.append(b)
-
-                        if filtered_bytes:
-                            # Проверяем, есть ли осмысленный текст подписи
-                            prompt = text if self._is_valid_user_prompt(text) else ""
-                            if not prompt:
-                                prompt = "Внимательно изучи изображение. Подробно объясни, реши или проанализируй то, что на нем представлено."
-
-                            logger.info(f"==> НОВОЕ ФОТО С ТЕЛЕФОНА [ID {idx}] ({len(filtered_bytes)} шт.): '{prompt[:80]}'")
-                            if self.on_message_callback:
-                                asyncio.create_task(self.on_message_callback(prompt, filtered_bytes))
+                        # Если все изображения сообщения оказались собственными карточками бота
+                        if not image_bytes_list:
                             continue
 
-                    # 2. Чисто текстовый вопрос
-                    if text and self._is_valid_user_prompt(text):
-                        logger.info(f"==> НОВЫЙ ТЕКСТОВЫЙ ВОПРОС С ТЕЛЕФОНА [ID {idx}]: '{text[:80]}'")
+                        # Пользовательское фото с телефона
+                        prompt = text if self._is_valid_user_prompt(text) else ""
+                        log_desc = f"'{prompt[:80]}'" if prompt else "[без подписи, прямое решение]"
+                        logger.info(f"==> НОВОЕ ФОТО С ТЕЛЕФОНА [ID {idx}] ({len(image_bytes_list)} шт.): {log_desc}")
                         if self.on_message_callback:
-                            asyncio.create_task(self.on_message_callback(text, None))
+                            asyncio.create_task(self.on_message_callback(prompt, image_bytes_list))
+                        continue
+
+                    # 2. Чисто текстовый вопрос
+                    if text:
+                        if self._is_valid_user_prompt(text):
+                            logger.info(f"==> НОВЫЙ ТЕКСТОВЫЙ ВОПРОС С ТЕЛЕФОНА [ID {idx}]: '{text[:80]}'")
+                            if self.on_message_callback:
+                                asyncio.create_task(self.on_message_callback(text, None))
+                        else:
+                            logger.info(f"Пропущено служебное сообщение/разделитель [ID {idx}]: '{text}'")
 
                 await asyncio.sleep(interval_sec)
             except Exception as e:
@@ -424,6 +466,8 @@ class MaxClient:
                 const history = document.querySelector('[class*="history"]') || document.querySelector('main') || document.body;
                 const items = history.querySelectorAll('[data-index]');
                 const res = [];
+                const occurrences = {};
+
                 items.forEach(it => {
                     const idxStr = it.getAttribute('data-index');
                     if (idxStr === null) return;
@@ -437,7 +481,7 @@ class MaxClient:
                         .filter(s => s && s.startsWith('http') && !s.includes('icon') && !s.includes('avatar') && !s.includes('emoji'));
 
                     // Поиск текста сообщения или подписи к фото
-                    const textSpan = it.querySelector('.text.svelte-1htnb3l');
+                    const textSpan = it.querySelector('.text.svelte-1htnb3l') || it.querySelector('[class*="text"]');
                     let text = '';
                     if (textSpan) {
                         text = textSpan.innerText.trim();
@@ -451,17 +495,28 @@ class MaxClient:
                         }
                     }
 
+                    // Время сообщения
+                    const metaEl = it.querySelector('.meta.svelte-1htnb3l, [class*="meta"]');
+                    const timeStr = metaEl ? metaEl.innerText.trim() : '';
+
+                    const baseKey = `${text}:::${timeStr}`;
+                    const occ = (occurrences[baseKey] || 0) + 1;
+                    occurrences[baseKey] = occ;
+
+                    const signature = `${baseKey}:::${occ}:::${imageUrls.length}`;
+
                     res.push({
+                        signature: signature,
                         index: idx,
                         images: imageUrls,
-                        text: text
+                        text: text,
+                        time: timeStr
                     });
                 });
-                res.sort((a, b) => a.index - b.index);
                 return res;
             }""")
 
-            unhandled = [m for m in items if not self.tracker.is_handled(m["index"])]
+            unhandled = [m for m in items if not self.tracker.is_handled(m["signature"])]
             return unhandled
         except Exception as e:
             logger.debug(f"Ошибка при получении сообщений: {e}")
@@ -476,27 +531,27 @@ class MaxClient:
         if not clean:
             return False
 
-        # 1. Должно содержать хотя бы одну букву (отсекает 100%, 8.44/11.13, 12:45 и т.д.)
-        if not re.search(r"[a-zA-Zа-яА-ЯёЁ]", clean):
+        # 1. Игнорируем чистые проценты загрузки ("100%", "45%")
+        if re.fullmatch(r"^\d+([.,]\d+)?%$", clean):
             return False
 
-        # 2. Игнорируем размеры файлов и индикаторы передачи (КБ, МБ, KB, MB, GB)
-        if re.search(r"(?:kb|mb|gb|кб|мб|гб)", clean, re.IGNORECASE):
+        # 2. Игнорируем чистые размеры файлов (например "8.44 МБ", "2.1 КБ", "500 KB")
+        if re.fullmatch(r"^\d+([.,]\d+)?\s*(?:kb|mb|gb|кб|мб|гб|b|б)$", clean, re.IGNORECASE):
             return False
 
-        # 3. Игнорируем соотношения чисел (например: 8.44 / 11.13 или 8.44 к 11.13)
-        if re.search(r"\d+\.?\d*\s*(?:\/|из|к|-|\\)\s*\d+\.?\d*", clean, re.IGNORECASE):
+        # 3. Игнорируем соотношения чисел/прогресс (например: 8.44 / 11.13 или 8.44 из 11.13)
+        if re.fullmatch(r"^\d+\.?\d*\s*(?:\/|из|к|-|\\)\s*\d+\.?\d*$", clean, re.IGNORECASE):
             return False
 
-        # 4. Игнорируем время сообщений ("12:43")
-        if re.match(r"^\d{1,2}:\d{2}$", clean):
+        # 4. Игнорируем чистое время сообщений ("12:43")
+        if re.fullmatch(r"^\d{1,2}:\d{2}$", clean):
             return False
 
-        # 5. Игнорируем даты ("Сегодня", "Вчера", "9 сентября 2026")
-        if re.match(r"^(?:сегодня|вчера|\d{1,2}\s+[а-я]+(?:\s+\d{4})?)$", clean, re.IGNORECASE):
+        # 5. Игнорируем системные разделители дат ("Сегодня", "Вчера", "9 сентября 2026")
+        if re.fullmatch(r"^(?:сегодня|вчера|\d{1,2}\s+[а-яё]+(?:\s+\d{4})?)$", clean, re.IGNORECASE):
             return False
 
-        # 6. Игнорируем служебные слова и плейсхолдеры
+        # 6. Игнорируем служебные слова и плейсхолдеры интерфейса
         lower = clean.lower()
         if lower in {"скачать", "сообщение", "фото", "файл", "видео"}:
             return False
