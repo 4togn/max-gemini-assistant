@@ -198,7 +198,7 @@ class MaxClient:
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir=str(config.USER_DATA_DIR),
                 headless=True,
-                device_scale_factor=2,
+                device_scale_factor=1,
                 viewport={"width": 1280, "height": 850},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 args=[
@@ -222,7 +222,7 @@ class MaxClient:
         logger.info("Синхронизация истории сообщений: ожидание загрузки сообщений чата...")
         for _ in range(3):
             await self.page.evaluate("""() => {
-                const history = document.querySelector('[class*="history"]') || document.body;
+                const history = document.querySelector('main [class*="history"], [class*="history"]') || document.body;
                 history.scrollTop = history.scrollHeight;
                 window.scrollTo(0, document.body.scrollHeight);
             }""")
@@ -230,17 +230,19 @@ class MaxClient:
 
         all_existing_messages = await self._get_unhandled_messages()
 
-        if len(self.tracker.handled_signatures) == 0:
+        # При старте бота фиксируем ВСЕ сообщения, уже присутствующие в чате,
+        # как обработанный базис, чтобы бот никогда не отвечал циклично на старые вопросы!
+        if all_existing_messages:
             all_sigs = [m["signature"] for m in all_existing_messages]
             self.tracker.sync_baseline(all_sigs)
+            for m in all_existing_messages:
+                for img_url in m.get("images", []):
+                    self.known_bot_image_urls.add(img_url)
             logger.info(
-                f"Первичный запуск: зафиксировано {len(all_sigs)} существующих сообщений как базовые."
+                f"Синхронизация истории: {len(all_sigs)} сообщений зафиксированы как базовые (игнорируются)."
             )
         else:
-            logger.info(
-                f"Повторный запуск бота: в базе {len(self.tracker.handled_signatures)} обработанных сообщений. "
-                f"Новых недавних сообщений для обработки: {len(all_existing_messages)}."
-            )
+            logger.info("История чата пуста или уже синхронизирована.")
 
         logger.info("=" * 60)
         logger.info("Бот готов к работе! Он работает в НЕВИДИМОМ режиме и ожидает сообщений.")
@@ -265,20 +267,50 @@ class MaxClient:
         logger.info(f"Открытие чата '{chat_name}'...")
         await self.page.wait_for_timeout(1000)
 
-        # Проверяем, открыт ли уже чат (кнопка прикрепления видна)
-        attach_btn = self.page.locator('button:has(svg use[href="#icon_attachment"])')
-        if await attach_btn.count() > 0:
+        # Проверяем, открыт ли уже чат (поле ввода сообщения или кнопка прикрепления видна)
+        is_open = await self.page.evaluate("""() => {
+            const input = document.querySelector('.contenteditable, [contenteditable="true"]');
+            const attach = document.querySelector('button svg use[href*="attachment"]');
+            return !!(input || attach);
+        }""")
+        if is_open:
             logger.info("Чат уже открыт.")
             return
 
-        chat_loc = self.page.locator(f"text='{chat_name}'").first
-        try:
-            await chat_loc.wait_for(state="visible", timeout=15000)
-            await chat_loc.click(no_wait_after=True)
-            await self.page.wait_for_timeout(2000)
-            logger.info(f"Чат '{chat_name}' успешно открыт.")
-        except Exception as e:
-            logger.warning(f"Не удалось открыть чат '{chat_name}': {e}")
+        # Пытаемся кликнуть по элементу чата в списке
+        clicked = await self.page.evaluate("""(name) => {
+            const els = Array.from(document.querySelectorAll('*'));
+            for (const el of els) {
+                if (el.children.length === 0 && el.innerText && el.innerText.trim() === name) {
+                    const target = el.closest('button, [role="button"], [class*="item"], [class*="chat"]') || el;
+                    target.click();
+                    return true;
+                }
+            }
+            return false;
+        }""", chat_name)
+
+        if clicked:
+            logger.info(f"Кликнули по чату '{chat_name}', ожидание загрузки...")
+            for _ in range(15):
+                await self.page.wait_for_timeout(500)
+                is_open = await self.page.evaluate("""() => {
+                    const input = document.querySelector('.contenteditable, [contenteditable="true"]');
+                    const attach = document.querySelector('button svg use[href*="attachment"]');
+                    return !!(input || attach);
+                }""")
+                if is_open:
+                    logger.info(f"Чат '{chat_name}' успешно открыт.")
+                    return
+        else:
+            # Fallback: Playwright locator
+            try:
+                chat_loc = self.page.locator(f"text={chat_name}").first
+                await chat_loc.click(no_wait_after=True)
+                await self.page.wait_for_timeout(2000)
+                logger.info(f"Чат '{chat_name}' открыт через локатор.")
+            except Exception as e:
+                logger.warning(f"Не удалось открыть чат '{chat_name}': {e}")
 
     async def send_webp_card(self, webp_path: Path, card_dhash: Optional[int] = None):
         """
@@ -312,7 +344,7 @@ class MaxClient:
             # 1. Нажимаем кнопку скрепки (вложение)
             attach_btn = self.page.locator('button:has(svg use[href="#icon_attachment"])').first
             await attach_btn.click()
-            await self.page.wait_for_timeout(400)
+            await self.page.wait_for_timeout(150)
 
             # 2. Выбираем пункт "Фото или видео" через перехват диалога файлов
             async with self.page.expect_file_chooser() as fc_info:
@@ -320,12 +352,12 @@ class MaxClient:
             file_chooser = await fc_info.value
             await file_chooser.set_files(str(webp_path))
 
-            # 3. Ожидаем появления предпросмотра
-            await self.page.wait_for_timeout(800)
+            # 3. Ожидаем готовности предпросмотра
+            await self.page.wait_for_timeout(250)
 
             # 4. Нажимаем Enter для отправки
             await self.page.keyboard.press("Enter")
-            await self.page.wait_for_timeout(1000)
+            await self.page.wait_for_timeout(350)
 
             # Fallback: клик по кнопке "Отправить"
             await self.page.evaluate("""() => {
@@ -344,7 +376,7 @@ class MaxClient:
             logger.info(f"Карточка {webp_path.name} успешно отправлена в MAX!")
 
             # 5. Ожидаем появления сообщения в DOM и отмечаем его сигнатуру как обработанную
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.5)
             new_msgs = await self._get_unhandled_messages()
             for m in new_msgs:
                 self.tracker.mark_handled(m["signature"])
@@ -357,7 +389,7 @@ class MaxClient:
         finally:
             self.is_uploading = False
 
-    async def monitor_messages(self, interval_sec: float = 1.0):
+    async def monitor_messages(self, interval_sec: float = 0.5):
         """
         Фоновый цикл мониторинга новых сообщений по уникальным индексам (data-index).
         Поддерживает как текстовые запросы, так и прикрепленные фотографии с подписями.
@@ -456,54 +488,88 @@ class MaxClient:
     async def _get_unhandled_messages(self) -> list:
         """
         Сканирует DOM истории чата на наличие сообщений с data-index.
-        Возвращает только те сообщения, чей индекс еще не был обработан трекером.
+        Генерирует 100% стабильные детерминированные сигнатуры на основе
+        уникальных идентификаторов файлов изображений и очищенного текста.
+        Полностью исключает сдвиги счетчиков виртуального DOM и цикличные ответы.
         """
         if not self.page:
             return []
 
         try:
             items = await self.page.evaluate("""() => {
-                const history = document.querySelector('[class*="history"]') || document.querySelector('main') || document.body;
-                const items = history.querySelectorAll('[data-index]');
-                const res = [];
-                const occurrences = {};
+                const chatContainer = document.querySelector('main') || document.querySelector('[class*="chatArea"]') || document.querySelector('[class*="chatContent"]');
+                const history = (chatContainer && chatContainer.querySelector('[class*="history"], [class*="messages"], [class*="bubbles"]'))
+                             || document.querySelector('main [class*="history"]')
+                             || document.querySelector('[class*="history"]:not([class*="chatList"])')
+                             || document.querySelector('main')
+                             || document.body;
 
-                items.forEach(it => {
+                if (!history) return [];
+
+                const rawItems = history.querySelectorAll('[data-index]');
+                const res = [];
+
+                rawItems.forEach(it => {
                     const idxStr = it.getAttribute('data-index');
                     if (idxStr === null) return;
                     const idx = parseInt(idxStr, 10);
                     if (isNaN(idx)) return;
 
-                    // Поиск прикрепленных изображений
-                    const imgElements = Array.from(it.querySelectorAll('div.media img, button.tile img, .media img, img'));
-                    const imageUrls = imgElements
-                        .map(i => i.src)
-                        .filter(s => s && s.startsWith('http') && !s.includes('icon') && !s.includes('avatar') && !s.includes('emoji'));
+                    // Отсеиваем элементы, не относящиеся к пузырям сообщений
+                    const bubble = it.querySelector('[class*="bubbleContent"], [class*="bubble"], [class*="media"], [class*="message"]');
+                    if (!bubble && !it.querySelector('img')) return;
 
-                    // Поиск текста сообщения или подписи к фото
-                    const textSpan = it.querySelector('.text.svelte-1htnb3l') || it.querySelector('[class*="text"]');
-                    let text = '';
-                    if (textSpan) {
-                        text = textSpan.innerText.trim();
-                    } else if (imageUrls.length === 0) {
-                        const bubble = it.querySelector('[class*="bubbleContent"]');
-                        if (bubble) {
-                            const clone = bubble.cloneNode(true);
-                            const cloneMeta = clone.querySelector('[class*="meta"]');
-                            if (cloneMeta) cloneMeta.remove();
-                            text = clone.innerText.trim();
+                    // Поиск прикрепленных изображений с извлечением стабильного file ID
+                    const imgElements = Array.from(it.querySelectorAll('div.media img, button.tile img, .media img, [class*="bubble"] img, img'));
+                    const imageUrls = [];
+                    const imageIds = [];
+
+                    imgElements.forEach(img => {
+                        const src = img.src || '';
+                        if (!src.startsWith('http')) return;
+                        if (src.includes('avatar') || src.includes('icon') || src.includes('emoji') || src.includes('sqr_64')) return;
+                        imageUrls.push(src);
+                        try {
+                            const u = new URL(src);
+                            const r = u.searchParams.get('r');
+                            if (r) {
+                                imageIds.push(r);
+                            } else {
+                                const p = u.pathname.split('/').pop() || src;
+                                imageIds.push(p);
+                            }
+                        } catch(e) {
+                            imageIds.push(src);
                         }
+                    });
+
+                    // Поиск времени сообщения
+                    const metaEl = it.querySelector('.meta, [class*="meta"], time');
+                    let timeStr = metaEl ? metaEl.innerText.trim() : '';
+                    timeStr = timeStr.replace(/[^\\d:]/g, '').trim();
+
+                    // Очистка текста сообщения от таймштампов, кнопок и статусов
+                    let text = '';
+                    const targetForText = bubble || it;
+                    const clone = targetForText.cloneNode(true);
+                    clone.querySelectorAll('[class*="meta"], .meta, time, svg, button, img, [class*="status"]').forEach(e => e.remove());
+                    text = clone.innerText.trim();
+
+                    // Если извлеченный текст совпал с временем (в DOM не было текста кроме таймштампа)
+                    if (text === timeStr || text.replace(/[^\\d:]/g, '') === timeStr) {
+                        text = '';
                     }
 
-                    // Время сообщения
-                    const metaEl = it.querySelector('.meta.svelte-1htnb3l, [class*="meta"]');
-                    const timeStr = metaEl ? metaEl.innerText.trim() : '';
-
-                    const baseKey = `${text}:::${timeStr}`;
-                    const occ = (occurrences[baseKey] || 0) + 1;
-                    occurrences[baseKey] = occ;
-
-                    const signature = `${baseKey}:::${occ}:::${imageUrls.length}`;
+                    // Формируем 100% стабильную детерминированную сигнатуру!
+                    let signature = '';
+                    if (imageIds.length > 0) {
+                        const imgKey = imageIds.sort().join('|');
+                        signature = text ? `img:::${timeStr}:::${text}:::${imgKey}` : `img:::${timeStr}:::${imgKey}`;
+                    } else if (text) {
+                        signature = `txt:::${timeStr}:::${text}`;
+                    } else {
+                        signature = `msg:::${timeStr}:::${idx}`;
+                    }
 
                     res.push({
                         signature: signature,

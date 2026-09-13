@@ -7,23 +7,36 @@ import config
 
 logger = logging.getLogger("GeminiClient")
 
-SYSTEM_INSTRUCTION = """Ты — умный и эрудированный ИИ-ассистент на базе модели Gemini.
-Твои ответы рендерятся в графические карточки, поэтому строго следуй правилам оформления:
-1. Математические формулы, дроби, корни, степени, интегралы ВСЕГДА форматируй строго в синтаксисе LaTeX:
-   - Инлайн формулы: в одинарных знаках доллара $...$, например: $\\sqrt{x^2 + y^2}$, $x_1 = \\frac{-b \\pm \\sqrt{D}}{2a}$.
-   - Блочные формулы: в двойных долларах $$...$$.
-2. Блоки кода оформляй в стандартные тройные бэктики с указанием языка программирования (например, ```python).
-3. Используй полноценную структуру Markdown: подробные объяснения, списки, жирный шрифт, таблицы при необходимости.
-4. ПРАВИЛА ОБРАБОТКИ ФОТО И СКРИНШОТОВ:
-   - Если на изображении тест, контрольная работа, задача, упражнение или вопросы:
-     СРАЗУ дай четкие, правильные ответы и пошаговые решения на каждое задание!
-   - Если на изображении фрагмент кода или ошибка программы:
-     кратко объясни причину ошибки и приведи полностью исправленный рабочий код.
-   - Если на изображении конспект, текст или документ:
-     переведи, перескажи или ответь на содержащиеся в нем вопросы в зависимости от контекста.
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО описывать визуальный вид фото или говорить: «На изображении показан белый листок бумаги с текстом».
-     Никаких пустых описаний окружения — сразу переходи к сути, ответам и решению!
-5. Отвечай развернуто, глубоко и по существу."""
+SYSTEM_INSTRUCTION = """Ты — интеллектуальный мультимодальный ИИ-ассистент на базе модели Gemini.
+Твои ответы оформляются в графические карточки, поэтому строго соблюдай правила:
+
+1. ОФОРМЛЕНИЕ:
+   - Математические формулы, дроби, корни, интегралы ВСЕГДА форматируй строго в LaTeX:
+     Инлайн формулы: в одинарных долларах $...$, например: $\\sqrt{x^2 + y^2}$, $x = \\frac{-b \\pm \\sqrt{D}}{2a}$.
+     Блочные формулы: в двойных долларах $$...$$.
+   - Блоки кода оформляй в стандартные тройные бэктики с указанием языка программирования (например, ```python, ```cpp).
+   - Используй аккуратную структуру Markdown: заголовки, списки, жирный шрифт, таблицы.
+
+2. АВТОНОМНОСТЬ И УНИВЕРСАЛЬНОСТЬ (САМ ДОГАДЫВАЙСЯ О СУТИ И ЦЕЛИ):
+   Действуй точно так же, как в нативном веб-интерфейсе Gemini: самостоятельно понимай намерение пользователя по контексту изображения. Никогда не задавай встречных вопросов, не говори «Что мне нужно сделать?», «Уточните запрос», «Чем я могу помочь?», «Здесь нет задач» или «На фото белый лист». Сразу выдавай готовый, профессиональный результат:
+   
+   - ЗАДАЧИ, ТЕСТЫ, УПРАЖНЕНИЯ, ВОПРОСЫ:
+     Если на изображении задача, тест, контрольная, уравнение или вопросы — сразу дай четкие, правильные ответы с подробным пошаговым решением и объяснением каждого пункта.
+
+   - ПРЕДМЕТЫ, ГАДЖЕТЫ, УСТРОЙСТВА, ТЕХНИКА (компьютерная мышь, клавиатура, смартфон, плата, инструмент, часы, одежда, автомобиль и др.):
+     Сразу точно определи объект, назови его точную модель и производителя (если различимы логотипы, форма или детали), подробно опиши назначение, ключевые характеристики, спецификации, особенности и функционал.
+
+   - РАСТЕНИЯ, ЖИВОТНЫЕ, ДОСТОПРИМЕЧАТЕЛЬНОСТИ, ПРОИЗВЕДЕНИЯ ИСКУССТВА:
+     Сразу назови вид, породу, название места или объекта, укажи интересные факты, происхождение и важные детали.
+
+   - ПРОГРАММНЫЙ КОД И ОШИБКИ:
+     Кратко укажи причину ошибки/бага и приведи полностью исправленный рабочий код.
+
+   - ДОКУМЕНТЫ, ТАБЛИЦЫ, КОНСПЕКТЫ, СКРИНШОТЫ ИНТЕРФЕЙСА:
+     Структурируй, переведи, выдели главное или перескажи суть информации.
+
+3. ПРИНЦИП ОТВЕТА:
+   Сразу к сути, глубоко, структурировано и без лишней «воды» и пустых описаний окружения."""
 
 
 def _detect_mime_type(data: bytes) -> str:
@@ -59,7 +72,7 @@ class GeminiClient:
     ) -> str:
         """
         Отправляет запрос к модели Gemini (текстовый или мультимодальный с фото).
-        Поддерживает автоматический retry при перегрузке (503 / 429) и fallback на резервную модель.
+        Поддерживает автоматический быстрый retry при 503 / 429.
         """
         client = self._get_client()
 
@@ -89,49 +102,56 @@ class GeminiClient:
         if prompt and prompt.strip():
             contents.append(prompt.strip())
         elif images:
-            contents.append("Реши задания, ответь на вопросы или выполни то, что требуется на изображении.")
+            # Универсальный prompt для фото без текста: ИИ сам автономно определяет суть
+            contents.append("Внимательно изучи изображение. Проанализируй его суть и автономно определи, что требуется: реши задачи/тесты, определи точную модель и характеристики предмета/устройства, исправь код или извлеки информацию. Дай исчерпывающий структурированный ответ по существу.")
 
-        # Список моделей для вызова: основная + резервная при 503 перегрузке
-        candidate_models = [self.model_name]
-        if "2.5-flash" not in self.model_name:
-            candidate_models.append("gemini-2.5-flash")
-
+        # Строго используем указанную пользователем модель (gemini-3.8-flash)
         last_error = None
-        for current_model in candidate_models:
-            for attempt in range(1, 4):
-                try:
-                    if attempt > 1:
-                        logger.info(f"Повторная попытка ({attempt}/3) к Gemini [{current_model}]...")
-                    response = await client.aio.models.generate_content(
-                        model=current_model,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_INSTRUCTION,
-                            temperature=0.7,
-                        ),
-                    )
-                    if response and response.text:
-                        return response.text
-                    else:
-                        raise ValueError("Получен пустой ответ от Gemini API.")
-                except Exception as e:
-                    last_error = e
-                    err_str = str(e)
-                    is_transient = any(
-                        term in err_str.lower()
-                        for term in ["503", "429", "unavailable", "high demand", "resourceexhausted"]
-                    )
-                    if is_transient and attempt < 3:
-                        wait_sec = attempt * 2
-                        logger.warning(f"Модель {current_model} временно занята (503/429). Ждем {wait_sec}с перед повтором...")
-                        await asyncio.sleep(wait_sec)
-                        continue
-                    elif is_transient and current_model != candidate_models[-1]:
-                        logger.warning(f"Модель {current_model} перегружена. Переключаемся на резервную {candidate_models[-1]}...")
-                        break
-                    else:
-                        logger.error(f"Ошибка вызова Gemini API [{current_model}]: {e}")
-                        break
+        for attempt in range(1, 5):
+            try:
+                if attempt > 1:
+                    logger.info(f"Повторная попытка ({attempt}/4) к Gemini [{self.model_name}]...")
+                response = await client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        temperature=0.7,
+                    ),
+                )
+                if response and response.text:
+                    return response.text
+                else:
+                    raise ValueError("Получен пустой ответ от Gemini API.")
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                is_transient = any(
+                    term in err_str.lower()
+                    for term in ["503", "429", "unavailable", "high demand", "resourceexhausted"]
+                )
+                if is_transient and attempt < 4:
+                    wait_sec = 0.5 * (2 ** (attempt - 1))
+                    logger.warning(f"Модель {self.model_name} временно занята (503/429). Быстрый повтор через {wait_sec:.1f}с...")
+                    await asyncio.sleep(wait_sec)
+                    continue
+                else:
+                    logger.error(f"Ошибка вызова Gemini API [{self.model_name}]: {e}")
+                    break
 
         if last_error:
             raise last_error
+
+    async def warmup(self):
+        """Прогревает HTTP-клиент и SSL-сессию к Gemini при старте бота."""
+        try:
+            client = self._get_client()
+            logger.info(f"Прогрев соединения с Gemini [{self.model_name}]...")
+            await client.aio.models.generate_content(
+                model=self.model_name,
+                contents="1+1=?",
+                config=types.GenerateContentConfig(temperature=0.1),
+            )
+            logger.info("Соединение с Gemini успешно прогрето (готов к мгновенному ответу).")
+        except Exception as e:
+            logger.warning(f"Прогрев Gemini завершился с предупреждением: {e}")

@@ -120,6 +120,9 @@ class BotApp:
         # Запускаем фоновый воркер обработки очереди
         self.worker_task = asyncio.create_task(self._message_worker())
 
+        # Прогреваем Gemini API для мгновенного ответа на первый запрос
+        await self.gemini.warmup()
+
         try:
             # Запуск клиента MAX
             await self.max_client.start()

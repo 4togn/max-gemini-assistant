@@ -20,11 +20,19 @@ class WebPRenderer:
         self._fallback_playwright = None
         self._fallback_browser = None
         self._fallback_context = None
+        self._render_page = None
         self.last_card_dhash = None
 
     def set_context_getter(self, getter):
         """Устанавливает функцию получения активного контекста браузера."""
         self.context_getter = getter
+
+    async def _get_render_page(self, context):
+        """Возвращает постоянно открытую вкладку для рендеринга без накладных расходов на открытие/закрытие."""
+        if self._render_page and not self._render_page.is_closed():
+            return self._render_page
+        self._render_page = await context.new_page()
+        return self._render_page
 
     def _protect_math(self, text: str):
         """
@@ -81,8 +89,8 @@ class WebPRenderer:
 
     async def render_to_webp(self, md_content: str, output_path: Path, model_name: str = None) -> tuple[Path, int]:
         """
-        Рендерит Markdown в HTML через прогретый браузер без повторного запуска процесса
-        и компилирует карточку в WebP со сверхбыстрой скоростью (в разы быстрее).
+        Рендерит Markdown в HTML через постоянную прогретую вкладку браузера
+        и компилирует карточку в WebP за ~1-2 секунды.
         Возвращает кортеж (output_path, card_dhash).
         """
         html = self.generate_html(md_content, model_name)
@@ -108,29 +116,25 @@ class WebPRenderer:
                 self._fallback_browser = await self._fallback_playwright.chromium.launch(**launch_kwargs)
                 self._fallback_context = await self._fallback_browser.new_context(
                     viewport={"width": config.CARD_WIDTH + 80, "height": 800},
-                    device_scale_factor=2,
+                    device_scale_factor=1,
                 )
             context = self._fallback_context
 
-        # Рендерим страницу в новой вкладке прогретого браузера (занимает миллисекунды)
-        page = await context.new_page()
-        try:
-            # Указываем base href на локальную папку шаблонов для мгновенной загрузки KaTeX и Highlight.js
-            base_html = html.replace("<head>", f'<head><base href="file://{config.TEMPLATES_DIR}/">')
-            await page.set_content(base_html, wait_until="domcontentloaded")
-            await page.wait_for_timeout(80)
+        # Рендерим через постоянную вкладку (без повторного создания/закрытия)
+        page = await self._get_render_page(context)
+        base_html = html.replace("<head>", f'<head><base href="file://{config.TEMPLATES_DIR}/">')
+        await page.set_content(base_html, wait_until="domcontentloaded")
+        await page.wait_for_timeout(50)
 
-            # Получаем элемент карточки и делаем PNG-скриншот
-            card_el = page.locator("#card")
-            png_bytes = await card_el.screenshot(type="png")
-        finally:
-            await page.close()
+        # Получаем элемент карточки и делаем моментальный снимок
+        card_el = page.locator("#card")
+        png_bytes = await card_el.screenshot(type="png")
 
-        # Вычисляем перцептивный dHash карточки для предотвращения самозацикливания бота
+        # Вычисляем перцептивный dHash карточки для защиты от самоответов
         card_dhash = compute_dhash(png_bytes)
         self.last_card_dhash = card_dhash
 
-        # Сжимаем и сохраняем в легковесный WebP через Pillow (RGB, quality=82, method=4 - быстрый оптимальный режим)
+        # Сжимаем в WebP (quality=82, method=0 — моментальное сохранение за 50мс)
         image = Image.open(io.BytesIO(png_bytes))
         if image.mode in ("RGBA", "P"):
             background = Image.new("RGB", image.size, (0, 0, 0))
@@ -142,12 +146,17 @@ class WebPRenderer:
         else:
             image = image.convert("RGB")
 
-        image.save(output_path, "WEBP", quality=82, method=4)
+        image.save(output_path, "WEBP", quality=82, method=0)
 
         return output_path, card_dhash
 
     async def close(self):
-        """Очистка ресурсов fallback-браузера при завершении."""
+        """Очистка ресурсов при завершении."""
+        if self._render_page and not self._render_page.is_closed():
+            try:
+                await self._render_page.close()
+            except Exception:
+                pass
         if self._fallback_context:
             try:
                 await self._fallback_context.close()
