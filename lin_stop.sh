@@ -10,15 +10,15 @@ if systemctl is-active --quiet max-gemini.service 2>/dev/null; then
     systemctl stop max-gemini.service
 fi
 
-BOT_PID=$(pgrep -f "[p]ython main.py" || true)
+BOT_PID=$(pgrep -f "[m]ain\.py" || true)
 
 if [ -n "$BOT_PID" ]; then
     echo "[+] Завершение процесса бота (PID: $BOT_PID)..."
     kill $BOT_PID 2>/dev/null || true
     sleep 2
-    if pgrep -f "[p]ython main.py" > /dev/null; then
+    if pgrep -f "[m]ain\.py" > /dev/null; then
         echo "[!] Принудительная остановка (kill -9)..."
-        pkill -9 -f "[p]ython main.py" 2>/dev/null || true
+        pkill -9 -f "[m]ain\.py" 2>/dev/null || true
     fi
     echo "[OK] Бот успешно остановлен."
 else

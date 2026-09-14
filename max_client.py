@@ -396,14 +396,22 @@ class MaxClient:
         """
         logger.info("Мониторинг активен: ожидаю новых сообщений с уникальным data-index...")
 
+        consecutive_errors = 0
         while self.is_running:
             try:
+                # Проверяем живость браузера и вкладки
+                if not self.page or self.page.is_closed() or (self.context and not self.context.pages):
+                    logger.critical("Критическая ошибка: вкладка или браузер закрылись! Завершение для перезапуска...")
+                    self.is_running = False
+                    raise RuntimeError("Browser context or page was closed unexpectedly.")
+
                 # Если прямо сейчас идет отправка ответа — ждем
                 if getattr(self, "is_uploading", False):
                     await asyncio.sleep(interval_sec)
                     continue
 
                 new_messages = await self._get_unhandled_messages()
+                consecutive_errors = 0
 
                 for msg in new_messages:
                     sig = msg["signature"]
@@ -459,7 +467,13 @@ class MaxClient:
 
                 await asyncio.sleep(interval_sec)
             except Exception as e:
-                logger.error(f"Ошибка в цикле мониторинга: {e}")
+                consecutive_errors += 1
+                err_str = str(e).lower()
+                logger.error(f"Ошибка в цикле мониторинга ({consecutive_errors}/5): {e}")
+                if "closed" in err_str or "target" in err_str or "crash" in err_str or consecutive_errors >= 5:
+                    logger.critical("Критическая ошибка: связь с браузером MAX потеряна. Завершаю работу для автоматического перезапуска.")
+                    self.is_running = False
+                    raise
                 await asyncio.sleep(2)
 
     async def _get_current_max_index(self) -> Optional[int]:
@@ -585,6 +599,10 @@ class MaxClient:
             unhandled = [m for m in items if not self.tracker.is_handled(m["signature"])]
             return unhandled
         except Exception as e:
+            err_str = str(e).lower()
+            if "closed" in err_str or "target" in err_str or "crash" in err_str:
+                logger.error(f"Браузер закрыт или аварийно упал: {e}")
+                raise
             logger.debug(f"Ошибка при получении сообщений: {e}")
             return []
 

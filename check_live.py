@@ -26,7 +26,7 @@ async def check_live_chat():
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
             ],
-            executable_path="/snap/bin/chromium" if Path("/snap/bin/chromium").exists() else None
+            executable_path=config.get_chromium_executable()
         )
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto("https://web.max.ru", wait_until="domcontentloaded", timeout=45000)

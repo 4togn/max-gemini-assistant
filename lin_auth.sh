@@ -21,18 +21,17 @@ if [ ! -d ".venv" ]; then
     $PYTHON_CMD -m venv .venv
     source .venv/bin/activate
     pip install -r requirements.txt --quiet
-    unset PLAYWRIGHT_DOWNLOAD_HOST
-    if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
-        if command -v apt-get &>/dev/null; then
-            apt-get update -qq && (apt-get install -y chromium-browser || apt-get install -y chromium) || true
-        fi
-    fi
-    if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
-        python -m playwright install chromium || true
-    fi
+    echo "[+] Загрузка автономного Chromium для Playwright..."
+    python -m playwright install chromium
     python -m playwright install-deps chromium 2>/dev/null || true
 else
     source .venv/bin/activate
+fi
+
+PLAYWRIGHT_CHROME=$(find "$HOME/.cache/ms-playwright" -name "chrome" -type f 2>/dev/null | head -n 1 || true)
+if [ -z "$PLAYWRIGHT_CHROME" ]; then
+    echo "[+] Загрузка автономного Chromium для Playwright..."
+    python -m playwright install chromium
 fi
 
 python auth.py

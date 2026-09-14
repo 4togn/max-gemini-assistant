@@ -75,20 +75,50 @@ USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 def get_chromium_executable() -> Optional[str]:
     """
-    Возвращает путь к системному Chromium/Chrome, если он установлен на Linux,
-    чтобы не зависеть от сетевых таймаутов storage.googleapis.com при скачивании через Playwright.
+    Возвращает путь к Chromium/Chrome на Linux.
+    В первую очередь ищет автономный Chromium от Playwright (~/.cache/ms-playwright)
+    или нативный системный deb-пакет Google Chrome/Chromium, так как Snap-пакеты
+    привязаны к сессии SSH и аварийно завершаются systemd-logind при закрытии соединения.
     """
     if os.name != "nt":  # Linux / macOS
+        # 1. Проверяем автономный бинарник Playwright (без привязки к Snap/systemd-сессии)
+        home = Path.home()
+        ms_cache = home / ".cache" / "ms-playwright"
+        if ms_cache.exists():
+            for p in sorted(ms_cache.glob("chromium-*/chrome-linux*/chrome"), reverse=True):
+                if p.exists() and os.access(p, os.X_OK):
+                    return str(p)
+
+        # 2. Проверяем нативный deb-пакет Google Chrome
         for candidate in [
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
-            "/snap/bin/chromium",
         ]:
             if os.path.exists(candidate):
                 return candidate
-        which_path = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+
+        # 3. Проверяем системный chromium (только если не snap-скрипт)
+        for candidate in [
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]:
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate, "r", errors="ignore") as f:
+                        content = f.read(512)
+                        if "snap" in content.lower():
+                            continue  # Пропускаем snap-обертку
+                except Exception:
+                    pass
+                return candidate
+
+        # 4. Резервный вариант: Snap (если ничего другого нет)
+        for snap_candidate in ["/snap/bin/chromium", "/usr/bin/chromium-browser"]:
+            if os.path.exists(snap_candidate):
+                return snap_candidate
+
+        which_path = shutil.which("google-chrome") or shutil.which("chromium")
         if which_path:
             return which_path
+
     return None

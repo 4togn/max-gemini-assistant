@@ -10,7 +10,7 @@ if systemctl is-active --quiet max-gemini.service 2>/dev/null; then
     systemctl status max-gemini.service --no-pager
 else
     echo "[-] Служба systemd не активна."
-    PID=$(pgrep -f "[p]ython main.py" || true)
+    PID=$(pgrep -f "[m]ain\.py" || true)
     if [ -n "$PID" ]; then
         echo "[i] Запущен локальный процесс (PID: $PID)"
     else

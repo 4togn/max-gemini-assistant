@@ -143,6 +143,7 @@ class BotApp:
             logger.info("Остановка бота пользователем...")
         except Exception as e:
             logger.critical(f"Критическая ошибка: {e}", exc_info=True)
+            raise
         finally:
             if self.worker_task:
                 self.worker_task.cancel()
@@ -159,3 +160,5 @@ if __name__ == "__main__":
         asyncio.run(app.run())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот успешно остановлен. До связи!")
+    except Exception:
+        sys.exit(1)

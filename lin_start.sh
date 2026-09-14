@@ -30,8 +30,8 @@ echo "[+] Активация виртуального окружения..."
 source .venv/bin/activate
 export PYTHONUNBUFFERED=1
 
-# Проверка, не запущен ли уже бот (шаблон [p]ython исключает сам pgrep)
-EXISTING_PID=$(pgrep -f "[p]ython main.py" || true)
+# Проверка, не запущен ли уже бот
+EXISTING_PID=$(pgrep -f "[m]ain\.py" || true)
 if [ -n "$EXISTING_PID" ]; then
     echo "[!] ВНИМАНИЕ: Бот уже работает в системе (PID: $EXISTING_PID)!"
     echo "[!] Чтобы остановить или перезапустить, используйте: ./lin_stop.sh"
@@ -48,14 +48,9 @@ if [ ! -f ".venv/.deps_installed" ]; then
     echo "[+] Первая настройка: проверка и установка зависимостей из requirements.txt..."
     pip install -r requirements.txt --quiet
     
-    unset PLAYWRIGHT_DOWNLOAD_HOST
-    if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
-        echo "[+] Системный Chromium не найден. Устанавливаю..."
-        if command -v apt-get &>/dev/null; then
-            apt-get update -qq && (apt-get install -y chromium-browser || apt-get install -y chromium) || true
-        fi
-    fi
-
+    echo "[+] Загрузка автономного Chromium для Playwright..."
+    python -m playwright install chromium
+    
     if [ "$(uname)" == "Linux" ]; then
         echo "[+] Проверка системных библиотек Chromium..."
         python -m playwright install-deps chromium 2>/dev/null || true
@@ -63,8 +58,16 @@ if [ ! -f ".venv/.deps_installed" ]; then
     touch .venv/.deps_installed
 fi
 
-# Проверка наличия Chromium
-if command -v chromium &>/dev/null || command -v chromium-browser &>/dev/null || [ -f "/snap/bin/chromium" ]; then
+# Дополнительная проверка: если автономный Chromium еще не загружен
+PLAYWRIGHT_CHROME=$(find "$HOME/.cache/ms-playwright" -name "chrome" -type f 2>/dev/null | head -n 1 || true)
+if [ -z "$PLAYWRIGHT_CHROME" ]; then
+    echo "[+] Загрузка автономного Chromium для Playwright..."
+    python -m playwright install chromium
+fi
+
+if [ -n "$PLAYWRIGHT_CHROME" ]; then
+    echo "[+] Автономный Chromium (Playwright) готов к работе: $PLAYWRIGHT_CHROME"
+elif command -v chromium &>/dev/null || command -v chromium-browser &>/dev/null || [ -f "/snap/bin/chromium" ]; then
     echo "[+] Системный Chromium готов к работе."
 fi
 
