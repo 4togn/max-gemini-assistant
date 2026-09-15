@@ -77,6 +77,7 @@ class GeminiClient:
         self.model_name = self.primary_model or ""
         self.last_used_model = self.primary_model or "Assistant"
         self._client = None
+        self._model_cooldowns = {}  # {model_name: expiry_timestamp}
 
     def _get_client(self):
         if not self._client:
@@ -93,12 +94,14 @@ class GeminiClient:
         """
         Отправляет запрос к модели Gemini (текстовый или мультимодальный с фото).
         Правила выполнения:
-        1. К основной модели (GEMINI_MODEL_1) делается ровно 3 попытки.
-        2. Если основная модель не ответила после 3 попыток:
-           - если резервные модели не заданы (GEMINI_MODEL_2..4 пустые) -> сразу выбрасывается ошибка.
-           - если заданы -> переходит по очереди к резервным моделям (пустые переменные уже пропущены).
-        3. Если и последняя резервная модель не ответила -> выбрасывается ошибка (бот отправляет карточку в чат).
+        1. Проверяет модели на кулдаун (если модель выдавала 503/429 в последние минуты,
+           она временно пропускается, чтобы пользователь не ждал по 3 минуты).
+        2. На каждую модель делается максимум 2 попытки с жестким таймаутом 25 сек.
+        3. При перегрузке (503) модель ставится на 3-минутный кулдаун и бот мгновенно
+           переключается на следующую резервную модель.
         """
+        import time
+
         if not self.primary_model:
             raise ValueError("Основная модель (GEMINI_MODEL_1) не указана в .env!")
 
@@ -130,71 +133,113 @@ class GeminiClient:
             contents.append(prompt.strip())
         elif images:
             # Универсальный prompt для фото без текста: ИИ сам автономно определяет суть
-            contents.append("Внимательно изучи изображение. Проанализируй его суть и автономно определи, что требуется: реши задачи/тесты, определи точную модель и характеристики предмета/устройства, исправь код или извлеки информацию. Дай исчерпывающий структурированный ответ по существу.")
+            contents.append("Внимательно изучи прикрепленные изображения. Проанализируй их суть и автономно определи, что требуется: реши задачи/тесты со всех страниц, определи точную модель и характеристики предметов/устройств, исправь код или извлеки информацию. Дай исчерпывающий структурированный ответ по существу.")
 
-        # Составляем список моделей: основная + заданные резервные (пустые уже отфильтрованы)
-        models_to_try = [self.primary_model] + self.backup_models
+        # Составляем список моделей: основная + заданные резервные
+        all_models = [self.primary_model] + self.backup_models
+        now = time.time()
+
+        # Фильтруем модели, находящиеся на временном кулдауне
+        models_to_try = []
+        for m in all_models:
+            cooldown_until = self._model_cooldowns.get(m, 0)
+            if now >= cooldown_until:
+                models_to_try.append(m)
+            else:
+                rem = int(cooldown_until - now)
+                logger.info(f"Модель [{m}] на кулдауне из-за недавней перегрузки ({rem}с осталось) -> быстрый переход к следующей")
+
+        # Если все модели на кулдауне, пробуем все заново
+        if not models_to_try:
+            logger.info("Все модели были на кулдауне. Сбрасываем таймеры и пробуем заново.")
+            models_to_try = all_models
+            self._model_cooldowns.clear()
 
         last_error = None
         for model_idx, current_model in enumerate(models_to_try, start=1):
-            is_primary = (model_idx == 1)
-            model_type = "Основная" if is_primary else f"Резервная #{model_idx - 1}"
+            is_primary = (current_model == self.primary_model)
+            model_type = "Основная" if is_primary else "Резервная"
 
-            # Делаем до 4 попыток на каждую модель (поскольку модель часто отвечает с 3-4 попытки)
-            for attempt in range(1, 5):
+            # Максимум 2 попытки (1 запрос + 1 быстрый повтор), чтобы не держать пользователя
+            max_attempts = 2
+            for attempt in range(1, max_attempts + 1):
                 try:
                     if attempt > 1:
-                        logger.info(f"Повторная попытка ({attempt}/4) к {model_type.lower()} модели [{current_model}]...")
+                        logger.info(f"Быстрый повтор ({attempt}/{max_attempts}) к {model_type.lower()} модели [{current_model}]...")
                     else:
-                        logger.info(f"Запрос к {model_type.lower()} модели [{current_model}] (попытка 1/4)...")
+                        logger.info(f"Запрос к {model_type.lower()} модели [{current_model}] (попытка 1/{max_attempts})...")
 
-                    response = await client.aio.models.generate_content(
-                        model=current_model,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_INSTRUCTION,
-                            temperature=0.7,
+                    # Жесткий таймаут 25с, чтобы запрос никогда не зависал на 5-15 минут
+                    response = await asyncio.wait_for(
+                        client.aio.models.generate_content(
+                            model=current_model,
+                            contents=contents,
+                            config=types.GenerateContentConfig(
+                                system_instruction=SYSTEM_INSTRUCTION,
+                                temperature=0.7,
+                            ),
                         ),
+                        timeout=25.0,
                     )
                     if response and response.text:
                         self.last_used_model = current_model
-                        logger.info(f"Успешный ответ от [{current_model}] (попытка {attempt}/4).")
+                        logger.info(f"Успешный ответ от [{current_model}] (попытка {attempt}/{max_attempts}).")
+                        # Очищаем кулдаун при успешном ответе
+                        self._model_cooldowns.pop(current_model, None)
                         return response.text
                     else:
                         raise ValueError(f"Получен пустой ответ от [{current_model}].")
 
+                except asyncio.TimeoutError:
+                    last_error = TimeoutError(f"Превышено время ожидания ответа от [{current_model}] (25с).")
+                    logger.warning(f"Таймаут (25с) при обращении к [{current_model}]. Ставлю на кулдаун на 3 мин.")
+                    self._model_cooldowns[current_model] = time.time() + 180
+                    break
+
                 except Exception as e:
                     last_error = e
-                    err_str = str(e)
+                    err_str = str(e).lower()
                     logger.warning(
-                        f"{model_type} модель [{current_model}] (попытка {attempt}/4) ошибка: {e}"
+                        f"{model_type} модель [{current_model}] (попытка {attempt}/{max_attempts}) ошибка: {e}"
                     )
 
-                    # Если исчерпан суточный лимит запросов (20 req/day per project), повторять бессмысленно
-                    is_daily_limit = "perday" in err_str.lower() or ("quota exceeded" in err_str.lower() and "limit: 20" in err_str.lower())
-                    if is_daily_limit:
+                    # 1. Лимиты запросов (429 Resource Exhausted)
+                    if "perday" in err_str or "quota exceeded" in err_str or "429" in err_str or "resource_exhausted" in err_str:
                         logger.warning(
-                            f"Суточный лимит для [{current_model}] исчерпан (429 perday). "
-                            f"Прекращаю повторы к этой модели и перехожу к следующей."
+                            f"Лимит запросов для [{current_model}] исчерпан (429). "
+                            f"Ставлю на кулдаун на 10 минут и перехожу к следующей."
                         )
+                        self._model_cooldowns[current_model] = time.time() + 600
                         break
 
-                    # Пауза перед следующей попыткой к той же модели (0.5с)
-                    if attempt < 4:
+                    # 2. Перегрузка серверов Google (503 Unavailable / High demand)
+                    if "503" in err_str or "unavailable" in err_str or "high demand" in err_str:
+                        if attempt >= max_attempts:
+                            logger.warning(
+                                f"Модель [{current_model}] перегружена (503). "
+                                f"Ставлю на кулдаун на 3 минуты и мгновенно переключаюсь дальше."
+                            )
+                            self._model_cooldowns[current_model] = time.time() + 180
+                            break
+                        else:
+                            await asyncio.sleep(0.5)
+                            continue
+
+                    # Пауза перед следующей попыткой
+                    if attempt < max_attempts:
                         await asyncio.sleep(0.5)
 
-            # Если все попытки к текущей модели завершились неудачей
+            # Переход к следующей модели
             has_next = (model_idx < len(models_to_try))
             if has_next:
                 next_model = models_to_try[model_idx]
                 logger.warning(
-                    f"Все 4 попытки к [{current_model}] исчерпаны. "
-                    f"Переключаюсь на следующую модель: [{next_model}]..."
+                    f"Модель [{current_model}] недоступна. "
+                    f"Мгновенно переключаюсь на следующую: [{next_model}]..."
                 )
             else:
                 logger.error(
-                    f"Все 4 попытки к последней доступной модели [{current_model}] исчерпаны. "
-                    f"Других моделей в .env нет."
+                    "Все доступные модели из каскада исчерпаны."
                 )
 
         # Если все доступные модели завершились ошибкой
@@ -210,25 +255,31 @@ class GeminiClient:
         # Сначала пробуем прогреть основную модель
         try:
             logger.info(f"Прогрев соединения с основной моделью [{self.primary_model}]...")
-            await client.aio.models.generate_content(
-                model=self.primary_model,
-                contents="1+1=?",
-                config=types.GenerateContentConfig(temperature=0.1),
+            await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=self.primary_model,
+                    contents="1+1=?",
+                    config=types.GenerateContentConfig(temperature=0.1),
+                ),
+                timeout=10.0,
             )
             logger.info(f"Основная модель [{self.primary_model}] успешно прогрета.")
             self.last_used_model = self.primary_model
             return
         except Exception as e:
-            logger.warning(f"Основная модель [{self.primary_model}] недоступна при прогреве (квота/занято): {e}")
+            logger.warning(f"Основная модель [{self.primary_model}] недоступна при прогреве: {e}")
 
         # Если основная недоступна, пробуем резервные по очереди
         for backup_model in self.backup_models:
             try:
                 logger.info(f"Прогрев соединения с резервной моделью [{backup_model}]...")
-                await client.aio.models.generate_content(
-                    model=backup_model,
-                    contents="1+1=?",
-                    config=types.GenerateContentConfig(temperature=0.1),
+                await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=backup_model,
+                        contents="1+1=?",
+                        config=types.GenerateContentConfig(temperature=0.1),
+                    ),
+                    timeout=10.0,
                 )
                 logger.info(f"Резервная модель [{backup_model}] успешно прогрета.")
                 self.last_used_model = backup_model

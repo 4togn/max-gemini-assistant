@@ -1,9 +1,16 @@
 import asyncio
 import logging
+import signal
 import sys
 import time
-from pathlib import Path
-from typing import Optional, List
+from typing import Optional
+
+# Игнорируем сигнал SIGHUP на Linux, чтобы процесс не завершался при закрытии SSH-терминала
+if hasattr(signal, "SIGHUP"):
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except Exception:
+        pass
 
 import config
 from gemini_client import GeminiClient
@@ -63,7 +70,7 @@ class BotApp:
 
         try:
             # 1. Запрос к Gemini (текстовый или мультимодальный с фото)
-            logger.info("Обращение к Gemini 3.8 Flash...")
+            logger.info(f"Обращение к Gemini [{self.gemini.primary_model}]...")
             ai_response = await self.gemini.generate_response(prompt=user_text, images=images)
             logger.info(f"Ответ от Gemini получен ({len(ai_response)} симв.)")
 
@@ -134,16 +141,27 @@ class BotApp:
         await self.gemini.warmup()
 
         try:
-            # Запуск клиента MAX
-            await self.max_client.start()
+            while True:
+                try:
+                    # Запуск клиента MAX
+                    await self.max_client.start()
 
-            # Запуск мониторинга
-            await self.max_client.monitor_messages()
-        except KeyboardInterrupt:
-            logger.info("Остановка бота пользователем...")
-        except Exception as e:
-            logger.critical(f"Критическая ошибка: {e}", exc_info=True)
-            raise
+                    # Запуск мониторинга
+                    await self.max_client.monitor_messages()
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    logger.info("Остановка бота пользователем...")
+                    break
+                except Exception as e:
+                    logger.error(
+                        f"Сбой сессии MAX/Chromium: {e}. "
+                        f"Автоматический перезапуск браузера через 5 секунд...",
+                        exc_info=True,
+                    )
+                    try:
+                        await self.max_client.close()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(5)
         finally:
             if self.worker_task:
                 self.worker_task.cancel()

@@ -1,20 +1,52 @@
-.venv/
+﻿# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
-env/
-venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Local configuration & credentials
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables & secrets
 .env
+*.env.local
+
+# Browser session & profile data (contains authentication cookies)
 user_data/
 
-# Bot outputs & state
+# Runtime state & deduplication database
+state.json
+
+# Generated cards and screenshots (preserve folder via .gitkeep)
 output/*
 !output/.gitkeep
-state.json
-blacklist.json
+
+# Logs and process outputs
 *.log
-*.tmp
+nohup.out
+
+# IDEs & System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini

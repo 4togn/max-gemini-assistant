@@ -2,7 +2,7 @@ import io
 import json
 import logging
 from pathlib import Path
-from typing import Set, List
+from typing import Set, List, Optional, Union
 from PIL import Image
 
 logger = logging.getLogger("MessageTracker")
@@ -87,25 +87,31 @@ class MessageTracker:
         except Exception as e:
             logger.error(f"Ошибка сохранения состояния: {e}")
 
-    def is_handled(self, item) -> bool:
+    def is_handled(self, item: Union[str, int], idx: Optional[int] = None) -> bool:
         """
         Проверяет, обработано ли сообщение.
-        Поддерживает как сигнатуру (str), так и старый целочисленный индекс (int).
+        Если передан idx, проверяет как сигнатуру, так и числовой индекс data-index.
         """
+        if idx is not None and idx in self.handled_indices:
+            return True
         if isinstance(item, str):
             return item in self.handled_signatures
         elif isinstance(item, int):
             return item in self.handled_indices
         return False
 
-    def mark_handled(self, item):
-        """Отмечает сообщение как обработанное."""
+    def mark_handled(self, item: Union[str, int], idx: Optional[int] = None):
+        """Отмечает сообщение как обработанное (по сигнатуре и/или индексу)."""
         if isinstance(item, str):
             self.handled_signatures.add(item)
         elif isinstance(item, int):
+            self.handled_indices.add(item)
             if item > self.last_handled_index:
                 self.last_handled_index = item
-            self.handled_indices.add(item)
+        if idx is not None:
+            self.handled_indices.add(idx)
+            if idx > self.last_handled_index:
+                self.last_handled_index = idx
         self.save()
 
     def add_bot_dhash(self, dhash: int):
@@ -129,10 +135,17 @@ class MessageTracker:
                 return True
         return False
 
-    def sync_baseline(self, signatures: List[str]):
-        """Фиксирует старую историю сообщений при первом запуске."""
+    def sync_baseline(self, signatures: List[str], indices: Optional[List[int]] = None):
+        """
+        Фиксирует историю сообщений чата при старте браузера:
+        сигнатуры добавляются в постоянную базу, а индексы инициализируют
+        текущую сессию.
+        """
         for sig in signatures:
             self.handled_signatures.add(sig)
+        if indices is not None:
+            self.handled_indices = set(indices)
+            self.last_handled_index = max(indices) if indices else -1
         self.save()
 
 

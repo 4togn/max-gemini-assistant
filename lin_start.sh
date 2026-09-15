@@ -80,6 +80,33 @@ if [ ! -f ".env" ]; then
     fi
 fi
 
+FOREGROUND=0
+for arg in "$@"; do
+    if [ "$arg" == "-f" ] || [ "$arg" == "--foreground" ]; then
+        FOREGROUND=1
+    fi
+done
+
+if [ "$FOREGROUND" -eq 0 ] && command -v systemctl &>/dev/null && [ -f "/etc/systemd/system/max-gemini.service" ]; then
+    echo "[+] Запуск службы max-gemini.service в фоновом режиме (systemd)..."
+    systemctl restart max-gemini.service
+    sleep 2
+    if systemctl is-active --quiet max-gemini.service; then
+        echo "============================================================"
+        echo " [OK] Бот успешно запущен в фоновом режиме (24/7 daemon)!"
+        echo "============================================================"
+        echo " [i] Бот защищен от закрытия SSH и перезагрузок сервера."
+        echo " [i] Смотреть живые логи: journalctl -u max-gemini -f"
+        echo " [i] Проверить статус:    systemctl status max-gemini"
+        echo " [i] Остановить бота:     ./lin_stop.sh"
+        echo " [i] Для отладки в окне:  ./lin_start.sh -f"
+        echo "============================================================"
+        exit 0
+    else
+        echo "[!] Предупреждение: служба systemd не запустилась, переключаюсь на прямой запуск..."
+    fi
+fi
+
 # Запуск бота
 echo "========================================="
 echo "        Запуск основного процесса...     "

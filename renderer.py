@@ -21,6 +21,7 @@ class WebPRenderer:
         self._fallback_browser = None
         self._fallback_context = None
         self._render_page = None
+        self._render_count = 0
         self.last_card_dhash = None
 
     def set_context_getter(self, getter):
@@ -28,10 +29,23 @@ class WebPRenderer:
         self.context_getter = getter
 
     async def _get_render_page(self, context):
-        """Возвращает постоянно открытую вкладку для рендеринга без накладных расходов на открытие/закрытие."""
+        """
+        Возвращает постоянно открытую вкладку для рендеринга без накладных расходов.
+        Каждые 20 рендеров вкладка пересоздается, чтобы сбросить V8 heap и внутреннюю память Chromium.
+        """
         if self._render_page and not self._render_page.is_closed():
-            return self._render_page
+            if self._render_count >= 20:
+                try:
+                    await self._render_page.close()
+                except Exception:
+                    pass
+                self._render_page = None
+                self._render_count = 0
+            else:
+                return self._render_page
+
         self._render_page = await context.new_page()
+        self._render_count = 0
         return self._render_page
 
     def _protect_math(self, text: str):
@@ -122,6 +136,7 @@ class WebPRenderer:
 
         # Рендерим через постоянную вкладку (без повторного создания/закрытия)
         page = await self._get_render_page(context)
+        self._render_count += 1
         base_html = html.replace("<head>", f'<head><base href="file://{config.TEMPLATES_DIR}/">')
         await page.set_content(base_html, wait_until="domcontentloaded")
         await page.wait_for_timeout(50)
@@ -129,6 +144,12 @@ class WebPRenderer:
         # Получаем элемент карточки и делаем моментальный снимок
         card_el = page.locator("#card")
         png_bytes = await card_el.screenshot(type="png")
+
+        # Очищаем DOM карточки, освобождая память вкладки
+        try:
+            await page.evaluate("() => { document.body.innerHTML = ''; }")
+        except Exception:
+            pass
 
         # Вычисляем перцептивный dHash карточки для защиты от самоответов
         card_dhash = compute_dhash(png_bytes)

@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 from playwright.async_api import async_playwright, BrowserContext, Page
@@ -23,6 +24,7 @@ class MaxClient:
         self.page: Optional[Page] = None
         self.is_running = False
         self.is_uploading = False
+        self._pending_settling: dict[int, dict] = {}
         self.known_bot_hashes: set = set()
         self.known_bot_image_urls: set = set()
         self._load_known_output_hashes()
@@ -228,14 +230,16 @@ class MaxClient:
             }""")
             await asyncio.sleep(1)
 
-        all_existing_messages = await self._get_unhandled_messages()
+        all_existing_messages = await self._get_unhandled_messages(scan_all=True)
 
         # При старте бота фиксируем ВСЕ сообщения, уже присутствующие в чате,
         # как обработанный базис, чтобы бот никогда не отвечал циклично на старые вопросы!
-        if all_existing_messages:
-            all_sigs = [m["signature"] for m in all_existing_messages]
-            self.tracker.sync_baseline(all_sigs)
-            for m in all_existing_messages:
+        ready_baseline = [m for m in all_existing_messages if not m.get("is_uploading") and m.get("signature")]
+        if ready_baseline:
+            all_sigs = [m["signature"] for m in ready_baseline]
+            all_idxs = [m["index"] for m in ready_baseline if "index" in m]
+            self.tracker.sync_baseline(all_sigs, all_idxs)
+            for m in ready_baseline:
                 for img_url in m.get("images", []):
                     self.known_bot_image_urls.add(img_url)
             logger.info(
@@ -339,8 +343,6 @@ class MaxClient:
             except Exception:
                 pass
 
-            start_max = await self._get_current_max_index() or 0
-
             # 1. Нажимаем кнопку скрепки (вложение)
             attach_btn = self.page.locator('button:has(svg use[href="#icon_attachment"])').first
             await attach_btn.click()
@@ -377,19 +379,20 @@ class MaxClient:
 
             # 5. Ожидаем появления сообщения в DOM и отмечаем его сигнатуру как обработанную
             await asyncio.sleep(0.5)
-            new_msgs = await self._get_unhandled_messages()
+            new_msgs = await self._get_unhandled_messages(scan_all=False)
             for m in new_msgs:
-                self.tracker.mark_handled(m["signature"])
-                for img_url in m.get("images", []):
-                    self.known_bot_image_urls.add(img_url)
-                logger.info(f"Собственная карточка бота [ID {m.get('index')}] зафиксирована и помечена как обработанная.")
+                if not m.get("is_uploading") and m.get("signature"):
+                    self.tracker.mark_handled(m["signature"], m.get("index"))
+                    for img_url in m.get("images", []):
+                        self.known_bot_image_urls.add(img_url)
+                    logger.info(f"Собственная карточка бота [ID {m.get('index')}] зафиксирована и помечена как обработанная.")
 
         except Exception as e:
             logger.error(f"Ошибка при отправке WebP в чат: {e}", exc_info=True)
         finally:
             self.is_uploading = False
 
-    async def monitor_messages(self, interval_sec: float = 0.5):
+    async def monitor_messages(self, interval_sec: float = 1.0):
         """
         Фоновый цикл мониторинга новых сообщений по уникальным индексам (data-index).
         Поддерживает как текстовые запросы, так и прикрепленные фотографии с подписями.
@@ -400,27 +403,126 @@ class MaxClient:
         while self.is_running:
             try:
                 # Проверяем живость браузера и вкладки
-                if not self.page or self.page.is_closed() or (self.context and not self.context.pages):
-                    logger.critical("Критическая ошибка: вкладка или браузер закрылись! Завершение для перезапуска...")
-                    self.is_running = False
-                    raise RuntimeError("Browser context or page was closed unexpectedly.")
+                if not self.page or self.page.is_closed():
+                    if self.context:
+                        logger.warning("Вкладка MAX закрылась или упала. Попытка восстановить вкладку в активном браузере...")
+                        try:
+                            # Проверяем, есть ли другая открытая вкладка в контексте
+                            active_pages = [p for p in self.context.pages if not p.is_closed()]
+                            if active_pages:
+                                self.page = active_pages[0]
+                            else:
+                                self.page = await self.context.new_page()
+                            await self.page.goto("https://web.max.ru", wait_until="domcontentloaded", timeout=45000)
+                            await self._open_chat(config.MAX_CHAT_NAME)
+                            logger.info("Вкладка MAX успешно восстановлена!")
+                            continue
+                        except Exception as rec_err:
+                            logger.error(f"Не удалось восстановить вкладку: {rec_err}")
+                            self.is_running = False
+                            raise RuntimeError(f"Browser tab closed and cannot be recovered: {rec_err}")
+                    else:
+                        logger.critical("Критическая ошибка: контекст браузера закрыт!")
+                        self.is_running = False
+                        raise RuntimeError("Browser context or page was closed unexpectedly.")
 
                 # Если прямо сейчас идет отправка ответа — ждем
                 if getattr(self, "is_uploading", False):
                     await asyncio.sleep(interval_sec)
                     continue
 
-                new_messages = await self._get_unhandled_messages()
+                new_messages = await self._get_unhandled_messages(scan_all=False)
                 consecutive_errors = 0
+                now = time.time()
 
+                # Очистка устаревших зависших элементов буфера (> 120 сек)
+                stale_keys = [
+                    k for k, v in self._pending_settling.items()
+                    if now - v.get("created_at", now) > 120
+                ]
+                for k in stale_keys:
+                    self._pending_settling.pop(k, None)
+
+                # Шаг 1: Добавляем или обновляем сообщения в буфере стабилизации
                 for msg in new_messages:
+                    idx = msg.get("index")
+                    sig = msg.get("signature")
+
+                    if self.tracker.is_handled(sig or "", idx):
+                        continue
+
+                    # Если сообщение все еще выгружается на сервер MAX
+                    if msg.get("is_uploading"):
+                        if idx not in self._pending_settling:
+                            self._pending_settling[idx] = {
+                                "msg": None,
+                                "settle_until": now + 2.0,
+                                "img_count": 0,
+                                "is_uploading": True,
+                                "created_at": now,
+                            }
+                            logger.info(f"Обнаружена загрузка фото в сообщении [ID {idx}] ({msg.get('reason')}), ожидание завершения...")
+                        else:
+                            entry = self._pending_settling[idx]
+                            entry["is_uploading"] = True
+                            entry["settle_until"] = now + 2.0
+                        continue
+
+                    # Сообщение готово (чистый текст или все фото выгружены с HTTP URL)
+                    images = msg.get("images", [])
+                    img_count = len(images)
+
+                    if idx not in self._pending_settling:
+                        # Если с фото — 1.5 сек на стабилизацию альбома
+                        # Если чистый текст — 1.0 сек на случай запоздалого появления контейнера фото
+                        hold_sec = 1.5 if img_count > 0 else 1.0
+                        self._pending_settling[idx] = {
+                            "msg": msg,
+                            "settle_until": now + hold_sec,
+                            "img_count": img_count,
+                            "is_uploading": False,
+                            "created_at": now,
+                        }
+                        if img_count > 0:
+                            logger.info(
+                                f"Сообщение [ID {idx}] с {img_count} фото ожидает стабилизации (1.5 сек)..."
+                            )
+                    else:
+                        entry = self._pending_settling[idx]
+                        was_uploading = entry.get("is_uploading", False)
+                        entry["is_uploading"] = False
+
+                        # Если закончилась загрузка или добавились новые фото в альбом
+                        prev_sig = entry["msg"]["signature"] if entry.get("msg") else ""
+                        if was_uploading or img_count > entry["img_count"] or sig != prev_sig:
+                            entry["msg"] = msg
+                            entry["img_count"] = img_count
+                            entry["settle_until"] = now + 1.5
+                            logger.info(
+                                f"Альбом [ID {idx}] обновлен (всего {img_count} фото), ожидание стабилизации сброшено (+1.5с)."
+                            )
+
+                # Шаг 2: Выбираем сообщения, завершившие период стабилизации
+                ready_indices = [
+                    idx for idx, entry in list(self._pending_settling.items())
+                    if now >= entry["settle_until"] and not entry.get("is_uploading", False) and entry.get("msg") is not None
+                ]
+
+                for idx in ready_indices:
+                    entry = self._pending_settling.pop(idx, None)
+                    if not entry:
+                        continue
+
+                    msg = entry["msg"]
                     sig = msg["signature"]
-                    idx = msg.get("index", 0)
                     text = msg["text"]
                     images = msg.get("images", [])
 
-                    # Отмечаем сообщение как обработанное по сигнатуре
-                    self.tracker.mark_handled(sig)
+                    if self.tracker.is_handled(sig, idx):
+                        continue
+
+                    # Фиксируем ОБА признака: и сигнатуру, и уникальный индекс сообщения в сессии
+                    self.tracker.mark_handled(sig, idx)
 
                     # 1. Если сообщение содержит фото от пользователя
                     if images:
@@ -448,7 +550,7 @@ class MaxClient:
                         if not image_bytes_list:
                             continue
 
-                        # Пользовательское фото с телефона
+                        # Пользовательские фото с телефона
                         prompt = text if self._is_valid_user_prompt(text) else ""
                         log_desc = f"'{prompt[:80]}'" if prompt else "[без подписи, прямое решение]"
                         logger.info(f"==> НОВОЕ ФОТО С ТЕЛЕФОНА [ID {idx}] ({len(image_bytes_list)} шт.): {log_desc}")
@@ -499,18 +601,19 @@ class MaxClient:
         except Exception:
             return None
 
-    async def _get_unhandled_messages(self) -> list:
+    async def _get_unhandled_messages(self, scan_all: bool = False) -> list:
         """
         Сканирует DOM истории чата на наличие сообщений с data-index.
+        При регулярном мониторинге сканирует только последние 8 сообщений чата,
+        а чистый текст извлекает обходом текстовых узлов без cloneNode и без принудительного reflow.
         Генерирует 100% стабильные детерминированные сигнатуры на основе
         уникальных идентификаторов файлов изображений и очищенного текста.
-        Полностью исключает сдвиги счетчиков виртуального DOM и цикличные ответы.
         """
         if not self.page:
             return []
 
         try:
-            items = await self.page.evaluate("""() => {
+            items = await self.page.evaluate("""(scanAll) => {
                 const chatContainer = document.querySelector('main') || document.querySelector('[class*="chatArea"]') || document.querySelector('[class*="chatContent"]');
                 const history = (chatContainer && chatContainer.querySelector('[class*="history"], [class*="messages"], [class*="bubbles"]'))
                              || document.querySelector('main [class*="history"]')
@@ -520,8 +623,39 @@ class MaxClient:
 
                 if (!history) return [];
 
-                const rawItems = history.querySelectorAll('[data-index]');
+                const allElements = history.querySelectorAll('[data-index]');
+                // При мониторинге сканируем только последние 8 элементов, чтобы не грузить CPU
+                const rawItems = scanAll ? Array.from(allElements) : Array.from(allElements).slice(-8);
                 const res = [];
+
+                // Быстрое извлечение чистого текста обходом узлов БЕЗ cloneNode и БЕЗ recalculate layout
+                function extractCleanText(rootNode) {
+                    if (!rootNode) return '';
+                    const skipTags = new Set(['SVG', 'BUTTON', 'IMG', 'TIME', 'SCRIPT', 'STYLE']);
+                    const textParts = [];
+
+                    function walk(node) {
+                        if (node.nodeType === 3) { // Text node
+                            const val = node.nodeValue;
+                            if (val) textParts.push(val);
+                            return;
+                        }
+                        if (node.nodeType === 1) { // Element node
+                            if (skipTags.has(node.tagName)) return;
+                            const cls = (node.className && typeof node.className === 'string') ? node.className : '';
+                            if (cls.includes('meta') || cls.includes('status')) return;
+                            if (node.tagName === 'BR') {
+                                textParts.push('\\n');
+                                return;
+                            }
+                            for (let i = 0; i < node.childNodes.length; i++) {
+                                walk(node.childNodes[i]);
+                            }
+                        }
+                    }
+                    walk(rootNode);
+                    return textParts.join('').trim();
+                }
 
                 rawItems.forEach(it => {
                     const idxStr = it.getAttribute('data-index');
@@ -533,6 +667,35 @@ class MaxClient:
                     const bubble = it.querySelector('[class*="bubbleContent"], [class*="bubble"], [class*="media"], [class*="message"]');
                     if (!bubble && !it.querySelector('img')) return;
 
+                    // 1. Проверяем, есть ли незавершенная загрузка в этом пузыре
+                    const contentImgs = Array.from(it.querySelectorAll('div.media img, button.tile img, .media img, [class*="bubble"] img, img:not([class*="avatar"])'));
+                    const hasBlobImg = contentImgs.some(img => {
+                        const s = (img.getAttribute('src') || img.src || '').trim();
+                        if (s.includes('avatar') || s.includes('icon') || s.includes('emoji')) return false;
+                        return s.startsWith('blob:') || s.startsWith('data:');
+                    });
+
+                    const hasProgressIndicator = !!it.querySelector(
+                        '[role="progressbar"], [class*="progressbar"], [class*="spinner"], svg circle[stroke-dasharray], [class*="uploading"], [class*="upload-progress"]'
+                    );
+
+                    let uploadReason = '';
+                    if (hasBlobImg) {
+                        uploadReason = 'hasBlobImg';
+                    } else if (hasProgressIndicator) {
+                        uploadReason = 'hasProgressIndicator';
+                    }
+
+                    if (uploadReason) {
+                        // В сообщении обнаружен активный процесс выгрузки/подгрузки медиа с телефона
+                        res.push({
+                            index: idx,
+                            is_uploading: true,
+                            reason: uploadReason
+                        });
+                        return;
+                    }
+
                     // Поиск прикрепленных изображений с извлечением стабильного file ID
                     const imgElements = Array.from(it.querySelectorAll('div.media img, button.tile img, .media img, [class*="bubble"] img, img'));
                     const imageUrls = [];
@@ -542,32 +705,37 @@ class MaxClient:
                         const src = img.src || '';
                         if (!src.startsWith('http')) return;
                         if (src.includes('avatar') || src.includes('icon') || src.includes('emoji') || src.includes('sqr_64')) return;
-                        imageUrls.push(src);
-                        try {
-                            const u = new URL(src);
-                            const r = u.searchParams.get('r');
-                            if (r) {
-                                imageIds.push(r);
-                            } else {
-                                const p = u.pathname.split('/').pop() || src;
-                                imageIds.push(p);
+                        if (!imageUrls.includes(src)) {
+                            imageUrls.push(src);
+                            try {
+                                const u = new URL(src);
+                                const r = u.searchParams.get('r');
+                                if (r) {
+                                    imageIds.push(r);
+                                } else {
+                                    const p = u.pathname.split('/').pop() || src;
+                                    imageIds.push(p);
+                                }
+                            } catch(e) {
+                                imageIds.push(src);
                             }
-                        } catch(e) {
-                            imageIds.push(src);
                         }
                     });
 
                     // Поиск времени сообщения
                     const metaEl = it.querySelector('.meta, [class*="meta"], time');
-                    let timeStr = metaEl ? metaEl.innerText.trim() : '';
+                    let timeStr = metaEl ? (metaEl.innerText || '').trim() : '';
                     timeStr = timeStr.replace(/[^\\d:]/g, '').trim();
 
-                    // Очистка текста сообщения от таймштампов, кнопок и статусов
-                    let text = '';
+                    // Быстрое извлечение чистого текста без cloneNode
                     const targetForText = bubble || it;
-                    const clone = targetForText.cloneNode(true);
-                    clone.querySelectorAll('[class*="meta"], .meta, time, svg, button, img, [class*="status"]').forEach(e => e.remove());
-                    text = clone.innerText.trim();
+                    let text = extractCleanText(targetForText);
+
+                    // Очистка от хвостового времени
+                    if (timeStr && text.endsWith(timeStr)) {
+                        text = text.slice(0, -timeStr.length).trim();
+                    }
+                    text = text.replace(/\\s*\\d{1,2}:\\d{2}\\s*$/, '').trim();
 
                     // Если извлеченный текст совпал с временем (в DOM не было текста кроме таймштампа)
                     if (text === timeStr || text.replace(/[^\\d:]/g, '') === timeStr) {
@@ -590,13 +758,20 @@ class MaxClient:
                         index: idx,
                         images: imageUrls,
                         text: text,
-                        time: timeStr
+                        time: timeStr,
+                        is_uploading: false
                     });
                 });
                 return res;
-            }""")
+            }""", scan_all)
 
-            unhandled = [m for m in items if not self.tracker.is_handled(m["signature"])]
+            unhandled = []
+            for m in items:
+                idx = m.get("index")
+                sig = m.get("signature", "")
+                if self.tracker.is_handled(sig, idx):
+                    continue
+                unhandled.append(m)
             return unhandled
         except Exception as e:
             err_str = str(e).lower()
