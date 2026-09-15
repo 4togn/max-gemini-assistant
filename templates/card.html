@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Answer Card</title>
+
+  <!-- KaTeX CSS & JS (Локальные файлы без задержек сети) -->
+  <link rel="stylesheet" href="vendor/katex.min.css">
+  <script defer src="vendor/katex.min.js"></script>
+  <script defer src="vendor/auto-render.min.js"></script>
+
+  <!-- Highlight.js (Локальная подсветка синтаксиса) -->
+  <link rel="stylesheet" href="vendor/github-dark-dimmed.min.css">
+  <script src="vendor/highlight.min.js"></script>
+
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      border-radius: 0 !important; /* Строго без закруглений */
+    }
+
+    body {
+      background: #000000;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      padding: 0;
+      margin: 0;
+      display: inline-block;
+      width: {{ width }}px;
+      color: #ffffff;
+    }
+
+    .card {
+      background: #000000;
+      padding: 24px 28px;
+      line-height: 1.65;
+      font-size: 16.5px;
+      word-break: break-word;
+      color: #ffffff;
+    }
+
+    .content {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .content h1, .content h2, .content h3, .content h4 {
+      color: #ffffff;
+      margin-top: 10px;
+      margin-bottom: 4px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+
+    .content h1 { font-size: 1.55rem; border-bottom: 1px solid #333333; padding-bottom: 8px; }
+    .content h2 { font-size: 1.35rem; }
+    .content h3 { font-size: 1.18rem; }
+    .content h4 { font-size: 1.05rem; }
+
+    .content p {
+      margin-bottom: 4px;
+      color: #eeeeee;
+    }
+
+    .content strong {
+      color: #ffffff;
+      font-weight: 700;
+    }
+
+    .content ul, .content ol {
+      margin-left: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: #eeeeee;
+    }
+
+    .content li {
+      padding-left: 4px;
+    }
+
+    /* Код и инлайн-блоки */
+    .content pre {
+      background: #0d0d0d !important;
+      border: 1px solid #222222;
+      padding: 14px 18px;
+      overflow-x: auto;
+      font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+      font-size: 14px;
+      line-height: 1.5;
+      margin: 8px 0;
+    }
+
+    .content code {
+      font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+      font-size: 14.5px;
+    }
+
+    .content p code, .content li code {
+      background: #1a1a1a;
+      color: #ff7b72;
+      padding: 2px 6px;
+      border: 1px solid #333333;
+    }
+
+    /* Цитаты */
+    .content blockquote {
+      border-left: 3px solid #ffffff;
+      padding: 8px 16px;
+      background: #0d0d0d;
+      color: #cccccc;
+      font-style: italic;
+    }
+
+    /* Таблицы */
+    .content table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 14.5px;
+    }
+
+    .content th, .content td {
+      border: 1px solid #333333;
+      padding: 8px 12px;
+      text-align: left;
+    }
+
+    .content th {
+      background: #151515;
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    .content tr:nth-child(even) {
+      background: #0a0a0a;
+    }
+
+    /* KaTeX формулы */
+    .katex-display {
+      margin: 12px 0 !important;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 6px 0;
+    }
+
+    .katex {
+      color: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <div id="card" class="card">
+    <div class="content">
+      {{ content_html | safe }}
+    </div>
+  </div>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", function() {
+      // Подсветка блоков кода
+      document.querySelectorAll('pre code').forEach((el) => {
+        hljs.highlightElement(el);
+      });
+
+      // Рендеринг формул KaTeX
+      renderMathInElement(document.body, {
+        delimiters: [
+          {left: '$$', right: '$$', display: true},
+          {left: '\\[', right: '\\]', display: true},
+          {left: '$', right: '$', display: false},
+          {left: '\\(', right: '\\)', display: false}
+        ],
+        throwOnError: false
+      });
+    });
+  </script>
+</body>
+</html>
