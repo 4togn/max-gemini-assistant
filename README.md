@@ -140,7 +140,7 @@ cd max-gemini-bot
 cp .env.example .env
 nano .env
 ```
-Укажите ваш ключ `GEMINI_API_KEY`(Если не сделали этого в `.env.example`.
+Укажите ваш ключ `GEMINI_API_KEY`(Если не сделали этого в `.env.example`).
 
 4. Сделайте скрипт исполняемым и запустите:
 ```bash
