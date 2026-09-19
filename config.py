@@ -4,18 +4,9 @@ from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
 
-# Загружаем переменные из .env файла (при отсутствии автоматически создаем из шаблона .env.example)
+# Загружаем переменные из .env файла
 BASE_DIR = Path(__file__).resolve().parent
-env_file = BASE_DIR / ".env"
-env_example = BASE_DIR / ".env.example"
-
-if not env_file.exists() and env_example.exists():
-    try:
-        shutil.copy(env_example, env_file)
-    except Exception:
-        pass
-
-load_dotenv(env_file)
+load_dotenv(BASE_DIR / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
@@ -32,11 +23,11 @@ def _clean_model_name(val: Optional[str]) -> Optional[str]:
     return val
 
 
-# Основная модель GEMINI_MODEL_1 (по умолчанию: gemini-2.5-flash)
+# Основная модель GEMINI_MODEL_1 (обязательна: если не указана, бот завершает работу)
 _m1_raw = os.getenv("GEMINI_MODEL_1")
 if _m1_raw is None:
-    _m1_raw = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-PRIMARY_MODEL = _clean_model_name(_m1_raw) or "gemini-2.5-flash"
+    _m1_raw = os.getenv("GEMINI_MODEL")
+PRIMARY_MODEL = _clean_model_name(_m1_raw)
 GEMINI_MODEL_1 = PRIMARY_MODEL
 
 # Резервные модели (2, 3, 4 и т.д.): если переменная пустая в .env — она пропускается!

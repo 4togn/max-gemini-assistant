@@ -71,9 +71,34 @@ class WebPRenderer:
             html = html.replace(f"%%MATH_BLOCK_{i}%%", block)
         return html
 
+    def _clean_unnecessary_latex(self, text: str) -> str:
+        """
+        Убирает случайное оборачивание обычных чисел, тире и стрелок в доллары ($),
+        а также исправляет частые опечатки LaTeX (например \\rughtararrow -> \\rightarrow).
+        """
+        # Исправление распространенных опечаток
+        text = text.replace(r"\rughtararrow", r"\rightarrow")
+        text = text.replace(r"\rigthararrow", r"\rightarrow")
+
+        # Одиночные стрелки в долларах -> юникод стрелка
+        text = re.sub(r"(?<!\\)\$\s*\\(?:rightarrow|to)\s*\$", " → ", text)
+
+        # Диапазоны чисел в долларах: $20\text{–}25$ или $20-25$ -> 20–25
+        text = re.sub(
+            r"(?<!\\)\$\s*(\d+)\s*(?:\\text\s*\{\s*[-–—]\s*\}|[-–—])\s*(\d+)\s*\$",
+            r"\1–\2",
+            text,
+        )
+
+        # Одиночные числа в долларах: $3$ -> 3, $12$ -> 12, $1.5$ -> 1.5
+        text = re.sub(r"(?<!\\)\$\s*(\d+(?:[.,]\d+)?)\s*\$", r"\1", text)
+
+        return text
+
     def markdown_to_html(self, md_text: str) -> str:
         """Конвертирует Markdown в HTML с поддержкой таблиц и блоков кода."""
-        protected_text, math_blocks = self._protect_math(md_text)
+        cleaned_text = self._clean_unnecessary_latex(md_text)
+        protected_text, math_blocks = self._protect_math(cleaned_text)
 
         html = markdown.markdown(
             protected_text,
@@ -122,6 +147,7 @@ class WebPRenderer:
                         "--disable-setuid-sandbox",
                         "--disable-dev-shm-usage",
                         "--disable-gpu",
+                        "--allow-file-access-from-files",
                     ],
                 }
                 exe = config.get_chromium_executable()
@@ -134,16 +160,23 @@ class WebPRenderer:
                 )
             context = self._fallback_context
 
+        # Сохраняем HTML во временный файл в templates для прямого открытия по file://
+        # (Chromium блокирует загрузку локальных CSS/JS/шрифтов при set_content из-за origin about:blank)
+        render_file = config.TEMPLATES_DIR / ".render_card.html"
+        render_file.write_text(html, encoding="utf-8")
+
         # Рендерим через постоянную вкладку (без повторного создания/закрытия)
         page = await self._get_render_page(context)
         self._render_count += 1
-        base_html = html.replace("<head>", f'<head><base href="file://{config.TEMPLATES_DIR}/">')
-        await page.set_content(base_html, wait_until="domcontentloaded")
-        await page.wait_for_timeout(50)
+        await page.goto(f"file://{render_file.resolve()}", wait_until="load")
+        try:
+            await page.evaluate("document.fonts.ready")
+        except Exception:
+            pass
 
         # Получаем элемент карточки и делаем моментальный снимок
         card_el = page.locator("#card")
-        png_bytes = await card_el.screenshot(type="png")
+        png_bytes = await card_el.screenshot(type="png", animations="disabled")
 
         # Очищаем DOM карточки, освобождая память вкладки
         try:

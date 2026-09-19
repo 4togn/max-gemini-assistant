@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+from pathlib import Path
 from playwright.async_api import async_playwright
 import config
 

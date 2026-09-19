@@ -94,6 +94,7 @@ class MaxClient:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--allow-file-access-from-files",
             ],
             **self._get_launch_kwargs(),
         )
@@ -209,6 +210,7 @@ class MaxClient:
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--allow-file-access-from-files",
                 ],
                 **self._get_launch_kwargs(),
             )
@@ -343,6 +345,8 @@ class MaxClient:
             except Exception:
                 pass
 
+            start_max = await self._get_current_max_index() or 0
+
             # 1. Нажимаем кнопку скрепки (вложение)
             attach_btn = self.page.locator('button:has(svg use[href="#icon_attachment"])').first
             await attach_btn.click()
@@ -472,10 +476,35 @@ class MaxClient:
                     images = msg.get("images", [])
                     img_count = len(images)
 
+                    if img_count > 0:
+                        # Проверяем, не предшествовало ли этому альбому чисто текстовое сообщение с описанием/запросом
+                        for prev_idx, prev_entry in list(self._pending_settling.items()):
+                            if prev_idx < idx and prev_entry.get("img_count", 0) == 0:
+                                prev_msg = prev_entry.get("msg")
+                                if prev_msg:
+                                    prev_text = prev_msg.get("text", "").strip()
+                                    curr_text = msg.get("text", "").strip()
+                                    # Если в фото-сообщении нет текста, переносим текст из предшествующего
+                                    if not curr_text and prev_text:
+                                        msg["text"] = prev_text
+                                    logger.info(
+                                        f"Объединено текстовое сообщение [ID {prev_idx}] ('{prev_text[:35]}...') "
+                                        f"с фото-сообщением [ID {idx}] ({img_count} фото)."
+                                    )
+                                    self.tracker.mark_handled(prev_msg.get("signature", ""), prev_idx)
+                                    self._pending_settling.pop(prev_idx, None)
+
                     if idx not in self._pending_settling:
                         # Если с фото — 1.5 сек на стабилизацию альбома
-                        # Если чистый текст — 1.0 сек на случай запоздалого появления контейнера фото
-                        hold_sec = 1.5 if img_count > 0 else 1.0
+                        # Если текст ссылается на прикрепленный материал — 3.5 сек (на мобильных фото загружаются следом за текстом)
+                        # Иначе для обычного текста — 1.0 сек
+                        is_media_ref = (img_count == 0) and bool(
+                            re.search(
+                                r"(?i)\b(параграф|фото|картинк|прикреп|страниц|задач|скрин|рисун|скинул|скинула|конспект|тетрад)",
+                                msg.get("text", ""),
+                            )
+                        )
+                        hold_sec = 3.5 if is_media_ref else (1.5 if img_count > 0 else 1.0)
                         self._pending_settling[idx] = {
                             "msg": msg,
                             "settle_until": now + hold_sec,
@@ -483,9 +512,13 @@ class MaxClient:
                             "is_uploading": False,
                             "created_at": now,
                         }
-                        if img_count > 0:
+                        if is_media_ref:
                             logger.info(
-                                f"Сообщение [ID {idx}] с {img_count} фото ожидает стабилизации (1.5 сек)..."
+                                f"Сообщение [ID {idx}] ссылается на учебный материал/фото, ожидание прикрепления ({hold_sec}с)..."
+                            )
+                        elif img_count > 0:
+                            logger.info(
+                                f"Сообщение [ID {idx}] с {img_count} фото ожидает стабилизации ({hold_sec} сек)..."
                             )
                     else:
                         entry = self._pending_settling[idx]

@@ -3,7 +3,8 @@ import logging
 import signal
 import sys
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Optional, List
 
 # Игнорируем сигнал SIGHUP на Linux, чтобы процесс не завершался при закрытии SSH-терминала
 if hasattr(signal, "SIGHUP"):
